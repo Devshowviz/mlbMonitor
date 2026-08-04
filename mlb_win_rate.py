@@ -111,7 +111,23 @@ def load_model(path: str) -> dict:
         "weights": weights,
         "scale": float(data.get("scale", 1.0)),
         "intercept": float(data.get("intercept", HOME_ADVANTAGE_LOGIT)),
+        "trained": data.get("trained"),
     }
+
+
+def describe_model(model: dict) -> str:
+    """어떤 모델(가중치)이 쓰이는지 한 줄로 요약한다."""
+    weights = ", ".join(
+        f"{name}={weight:.2f}" for name, weight in model["weights"].items()
+    )
+    line = f"모델: scale={model['scale']:.2f}, intercept={model['intercept']:.2f} | {weights}"
+    trained = model.get("trained")
+    if trained and "holdout_logloss" in trained:
+        line += (
+            f" | 학습: {trained.get('season')}시즌"
+            f" 홀드아웃 로그손실 {trained['holdout_logloss']}"
+        )
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +750,9 @@ def parse_games(
     games = []
     for day in schedule.get("dates", []):
         for game in day.get("games", []):
+            # 올스타전(A)·시범경기(E)는 전력 예측 대상이 아니다.
+            if game.get("gameType") in ("A", "E"):
+                continue
             away = game["teams"]["away"]
             home = game["teams"]["home"]
 
@@ -873,11 +892,15 @@ def evaluation_stats(games: list[dict]) -> dict | None:
         return None
 
     hits = 0
+    home_wins = 0
+    pred_home_sum = 0.0
     total_log_loss = 0.0
     total_brier = 0.0
     for game in finished:
         actual = 1 if game["home_score"] > game["away_score"] else 0
+        home_wins += actual
         prob = min(max(game["home_win_prob"], 1e-12), 1 - 1e-12)
+        pred_home_sum += game["home_win_prob"]
         if (prob >= 0.5) == (actual == 1):
             hits += 1
         total_log_loss += -(
@@ -892,11 +915,17 @@ def evaluation_stats(games: list[dict]) -> dict | None:
         "accuracy": round(hits / count, 3),
         "log_loss": round(total_log_loss / count, 4),
         "brier": round(total_brier / count, 4),
+        # 캘리브레이션 진단: 평균 예측 확률과 실제 비율이 다르면 체계적 편향.
+        "avg_pred_home": round(pred_home_sum / count, 3),
+        "actual_home_rate": round(home_wins / count, 3),
     }
 
     # 마켓 예측(핸디캡/언더오버)도 실제 점수로 검증한다 (브라이어 점수).
     runline_brier = runline_hits = runline_count = 0
+    runline_pred_sum = runline_covers = 0.0
     over_brier = over_hits = over_count = 0
+    over_pred_sum = over_actual = 0.0
+    expected_total_sum = actual_total_sum = 0.0
     for game in finished:
         markets = game.get("markets")
         if not markets:
@@ -905,13 +934,19 @@ def evaluation_stats(games: list[dict]) -> dict | None:
         total = game["home_score"] + game["away_score"]
 
         actual_cover = 1 if margin > markets["run_line"] else 0
+        runline_covers += actual_cover
+        runline_pred_sum += markets["home_runline_prob"]
         runline_brier += (markets["home_runline_prob"] - actual_cover) ** 2
         if (markets["home_runline_prob"] >= 0.5) == (actual_cover == 1):
             runline_hits += 1
         runline_count += 1
 
+        expected_total_sum += markets["expected_total"]
+        actual_total_sum += total
         if total != markets["total_line"]:  # 정수 기준선의 푸시(동률)는 제외
             actual_over = 1 if total > markets["total_line"] else 0
+            over_actual += actual_over
+            over_pred_sum += markets["over_prob"]
             over_brier += (markets["over_prob"] - actual_over) ** 2
             if (markets["over_prob"] >= 0.5) == (actual_over == 1):
                 over_hits += 1
@@ -922,12 +957,18 @@ def evaluation_stats(games: list[dict]) -> dict | None:
             "games": runline_count,
             "accuracy": round(runline_hits / runline_count, 3),
             "brier": round(runline_brier / runline_count, 4),
+            "avg_pred_cover": round(runline_pred_sum / runline_count, 3),
+            "actual_cover_rate": round(runline_covers / runline_count, 3),
         }
     if over_count:
         stats["over_under"] = {
             "games": over_count,
             "accuracy": round(over_hits / over_count, 3),
             "brier": round(over_brier / over_count, 4),
+            "avg_pred_over": round(over_pred_sum / over_count, 3),
+            "actual_over_rate": round(over_actual / over_count, 3),
+            "avg_expected_total": round(expected_total_sum / runline_count, 2),
+            "avg_actual_total": round(actual_total_sum / runline_count, 2),
         }
     return stats
 
@@ -937,6 +978,8 @@ def format_evaluation(stats: dict) -> str:
         f"=== 예측 검증 (끝난 경기 {stats['games']}건) ===",
         f"승패     적중 {stats['hits']}/{stats['games']} ({stats['accuracy']:.1%})"
         f"  로그손실 {stats['log_loss']:.4f}  브라이어 {stats['brier']:.4f}",
+        f"         평균 예측 홈승 {stats['avg_pred_home']:.1%}"
+        f" vs 실제 홈승률 {stats['actual_home_rate']:.1%}",
     ]
     if "runline" in stats:
         runline = stats["runline"]
@@ -944,11 +987,21 @@ def format_evaluation(stats: dict) -> str:
             f"핸디캡   적중률 {runline['accuracy']:.1%}"
             f"  브라이어 {runline['brier']:.4f} ({runline['games']}건, 홈 -1.5 기준)"
         )
+        lines.append(
+            f"         평균 예측 커버 {runline['avg_pred_cover']:.1%}"
+            f" vs 실제 커버율 {runline['actual_cover_rate']:.1%}"
+        )
     if "over_under" in stats:
         over_under = stats["over_under"]
         lines.append(
             f"언더오버 적중률 {over_under['accuracy']:.1%}"
             f"  브라이어 {over_under['brier']:.4f} ({over_under['games']}건)"
+        )
+        lines.append(
+            f"         평균 예측 오버 {over_under['avg_pred_over']:.1%}"
+            f" vs 실제 오버율 {over_under['actual_over_rate']:.1%}"
+            f" | 예상 평균 합계 {over_under['avg_expected_total']:.2f}"
+            f" vs 실제 평균 합계 {over_under['avg_actual_total']:.2f}"
         )
     lines.append(
         "(참고: 동전던지기 로그손실 0.6931, 전적 기반 모델의 현실적 수준 ≈ 0.68)"
@@ -1016,11 +1069,20 @@ def main(argv: list[str] | None = None) -> int:
         try:
             model = load_model(weights_path)
             print(f"학습된 가중치 사용: {weights_path}", file=sys.stderr)
+            if not model.get("trained"):
+                print(
+                    "경고: 이 가중치 파일에는 학습 메타데이터가 없습니다 —"
+                    " 구버전 backtest로 만든 파일일 수 있으니"
+                    " `python backtest.py --season 2025 --output weights.json`으로"
+                    " 재학습하거나 파일을 지우고 기본 가중치를 쓰세요.",
+                    file=sys.stderr,
+                )
         except (OSError, ValueError, json.JSONDecodeError) as error:
             print(
                 f"경고: 가중치 파일을 읽지 못해 기본 가중치를 사용합니다: {error}",
                 file=sys.stderr,
             )
+    print(describe_model(model), file=sys.stderr)
 
     # Elo용 시즌 결과는 범위 전체에 대해 한 번만 가져온다 (마지막 날 전날까지).
     season_results: list[dict] = []

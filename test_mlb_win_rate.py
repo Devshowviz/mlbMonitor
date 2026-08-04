@@ -494,6 +494,30 @@ class LoadModelTest(unittest.TestCase):
         self.assertEqual(model["weights"]["elo"], 0.5)
         self.assertEqual(model["scale"], 2.0)
         self.assertEqual(model["intercept"], 0.12)
+        self.assertIsNone(model["trained"])  # 구버전 파일 → 메타데이터 없음
+
+    def test_trained_metadata_preserved(self):
+        path = self._write(
+            {
+                "weights": {"season": 1.0},
+                "trained": {"season": 2025, "holdout_logloss": 0.6789},
+            }
+        )
+        model = load_model(path)
+        self.assertEqual(model["trained"]["holdout_logloss"], 0.6789)
+
+    def test_describe_model_mentions_training(self):
+        from mlb_win_rate import DEFAULT_MODEL, describe_model
+
+        text = describe_model(DEFAULT_MODEL)
+        self.assertIn("scale=1.00", text)
+        trained_model = {
+            "weights": {"season": 1.0},
+            "scale": 0.9,
+            "intercept": 0.2,
+            "trained": {"season": 2025, "holdout_logloss": 0.6789},
+        }
+        self.assertIn("0.6789", describe_model(trained_model))
 
     def test_missing_optional_fields_get_defaults(self):
         path = self._write({"weights": {"season": 1.0}})
@@ -667,6 +691,30 @@ class ParseGamesTest(unittest.TestCase):
     def test_empty_schedule(self):
         self.assertEqual(parse_games({"dates": []}), [])
 
+    def test_all_star_and_exhibition_games_skipped(self):
+        schedule = {
+            "dates": [
+                {
+                    "games": [
+                        {
+                            "gameType": "A",  # 올스타전
+                            "status": {"detailedState": "Final"},
+                            "teams": {
+                                "away": {"team": {"id": 1, "name": "AL All-Stars"},
+                                         "leagueRecord": {"wins": 1, "losses": 0}},
+                                "home": {"team": {"id": 2, "name": "NL All-Stars"},
+                                         "leagueRecord": {"wins": 0, "losses": 1}},
+                            },
+                        },
+                        dict(SAMPLE_SCHEDULE["dates"][0]["games"][1], gameType="R"),
+                    ]
+                }
+            ]
+        }
+        games = parse_games(schedule)
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]["home_team"], "New York Yankees")
+
 
 class FormatTableTest(unittest.TestCase):
     def setUp(self):
@@ -745,6 +793,20 @@ class EvaluationStatsTest(unittest.TestCase):
         text = format_evaluation(stats)
         self.assertIn("핸디캡", text)
         self.assertIn("언더오버", text)
+
+    def test_calibration_diagnostics(self):
+        stats = evaluation_stats(self.games)
+        # 홈(다저스)이 이겼으므로 실제 홈승률 1.0
+        self.assertEqual(stats["actual_home_rate"], 1.0)
+        self.assertGreater(stats["avg_pred_home"], 0.5)
+        self.assertEqual(stats["runline"]["actual_cover_rate"], 1.0)  # 5:3 → 마진 2
+        over_under = stats["over_under"]
+        self.assertEqual(over_under["actual_over_rate"], 0.0)  # 합 8 < 8.5
+        self.assertEqual(over_under["avg_actual_total"], 8.0)
+        self.assertGreater(over_under["avg_expected_total"], 5.0)
+        text = format_evaluation(stats)
+        self.assertIn("평균 예측 홈승", text)
+        self.assertIn("실제 평균 합계", text)
 
 
 class SeasonFromStandingsTest(unittest.TestCase):
