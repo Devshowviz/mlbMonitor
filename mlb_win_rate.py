@@ -86,6 +86,13 @@ AWAY_RUNS_FACTOR = 0.98       # 원정팀 득점 보정
 STARTER_INNINGS_SHARE = 0.55  # 선발 투수가 책임지는 이닝 비중 (FIP 보정에 사용)
 MAX_RUNS_GRID = 30            # 푸아송 점수 격자 상한 (그 이상 득점 확률은 무시 가능)
 
+# 총득점(언더오버) 분포의 분산/평균 비율. 실제 MLB 총득점은 두 팀 득점이
+# 구장·날씨 등으로 양의 상관을 가져 푸아송(비율 1.0)보다 분산이 훨씬 크고
+# 오른쪽으로 치우친다 — 평균이 같아도 기준선 아래에 더 자주 떨어진다.
+# 실측 총득점 표준편차(약 4.5점, 분산/평균 ≈ 2.2)에 맞춘 값.
+# 마진(승패·핸디캡)은 상관이 상쇄되므로 독립 푸아송을 그대로 쓴다.
+TOTAL_VARIANCE_RATIO = 2.2
+
 # Elo 파라미터 (FiveThirtyEight MLB Elo에서 착안)
 ELO_INITIAL = 1500.0    # 시즌 시작 레이팅
 ELO_K = 4.0             # 경기당 레이팅 이동 폭
@@ -124,8 +131,17 @@ def describe_model(model: dict) -> str:
     line = f"모델: scale={model['scale']:.2f}, intercept={model['intercept']:.2f} | {weights}"
     trained = model.get("trained")
     if trained and "holdout_logloss" in trained:
+        seasons = trained.get("seasons") or (
+            [trained["season"]] if trained.get("season") else []
+        )
+        if len(seasons) > 1:
+            season_label = f"{min(seasons)}-{max(seasons)}"
+        elif seasons:
+            season_label = str(seasons[0])
+        else:
+            season_label = "?"
         line += (
-            f" | 학습: {trained.get('season')}시즌"
+            f" | 학습: {season_label}시즌"
             f" 홀드아웃 로그손실 {trained['holdout_logloss']}"
         )
     return line
@@ -288,6 +304,22 @@ def poisson_pmf(k: int, mu: float) -> float:
     return math.exp(-mu) * mu**k / math.factorial(k)
 
 
+def negative_binomial_pmf(k: int, mean: float, variance_ratio: float) -> float:
+    """평균 mean, 분산 variance_ratio×mean인 음이항 분포의 pmf.
+
+    variance_ratio가 1.0이면 푸아송과 같으므로 그대로 푸아송을 쓴다.
+    """
+    if variance_ratio <= 1.0:
+        return poisson_pmf(k, mean)
+    r = mean / (variance_ratio - 1.0)  # 분산 = mean × ratio가 되는 크기 파라미터
+    p = r / (r + mean)
+    log_pmf = (
+        math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1)
+        + r * math.log(p) + k * math.log(1.0 - p)
+    )
+    return math.exp(log_pmf)
+
+
 def league_runs_per_game(standings_index: dict[int, dict]) -> float:
     """standings에서 리그 전체 팀당 경기당 평균 득점을 계산한다."""
     total_runs = sum(team["runs_scored"] for team in standings_index.values())
@@ -358,7 +390,7 @@ def market_probs(
     away_pmf = [poisson_pmf(k, mu_away) for k in range(MAX_RUNS_GRID)]
 
     p_home_win = p_away_win = p_tie = 0.0
-    p_home_cover = p_away_cover = p_over = 0.0
+    p_home_cover = p_away_cover = 0.0
     for h, ph in enumerate(home_pmf):
         for a, pa in enumerate(away_pmf):
             p = ph * pa
@@ -373,8 +405,14 @@ def market_probs(
                 p_home_cover += p
             if -margin > run_line:
                 p_away_cover += p
-            if h + a > total_line:
-                p_over += p
+
+    # 총득점(언더오버)은 두 팀 득점의 양의 상관을 반영해 과분산 음이항으로 계산.
+    total_mean = mu_home + mu_away
+    p_over = sum(
+        negative_binomial_pmf(k, total_mean, TOTAL_VARIANCE_RATIO)
+        for k in range(2 * MAX_RUNS_GRID)
+        if k > total_line
+    )
 
     decided = p_home_win + p_away_win
     home_share = p_home_win / decided if decided > 0 else 0.5

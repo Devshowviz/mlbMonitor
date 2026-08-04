@@ -310,6 +310,36 @@ class MarketTest(unittest.TestCase):
         total = sum(poisson_pmf(k, 4.5) for k in range(30))
         self.assertAlmostEqual(total, 1.0, places=9)
 
+    def test_negative_binomial_mean_and_variance(self):
+        from mlb_win_rate import negative_binomial_pmf
+
+        pmf = [negative_binomial_pmf(k, 9.0, 2.2) for k in range(120)]
+        self.assertAlmostEqual(sum(pmf), 1.0, places=6)
+        mean = sum(k * p for k, p in enumerate(pmf))
+        variance = sum(k * k * p for k, p in enumerate(pmf)) - mean**2
+        self.assertAlmostEqual(mean, 9.0, places=3)
+        self.assertAlmostEqual(variance, 9.0 * 2.2, places=2)
+
+    def test_negative_binomial_ratio_one_is_poisson(self):
+        from mlb_win_rate import negative_binomial_pmf
+
+        for k in range(10):
+            self.assertAlmostEqual(
+                negative_binomial_pmf(k, 4.5, 1.0), poisson_pmf(k, 4.5), places=12
+            )
+
+    def test_overdispersion_lowers_over_prob_near_mean(self):
+        # 평균이 기준선 바로 위일 때, 과분산(오른쪽 치우침) 분포는
+        # 푸아송보다 오버 확률이 낮아야 한다 — 7월 검증에서 확인된 편향의 수정.
+        from mlb_win_rate import negative_binomial_pmf
+
+        poisson_over = sum(poisson_pmf(k, 9.07) for k in range(80) if k > 8.5)
+        nb_over = sum(
+            negative_binomial_pmf(k, 9.07, 2.2) for k in range(80) if k > 8.5
+        )
+        self.assertLess(nb_over, poisson_over)
+        self.assertLess(abs(nb_over - 0.5), 0.02)
+
     def test_league_runs_per_game(self):
         index = build_standings_index(SAMPLE_STANDINGS)
         # (580+500) / (110+110) = 4.909...
