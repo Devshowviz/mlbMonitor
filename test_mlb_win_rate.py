@@ -16,7 +16,9 @@ from mlb_win_rate import (
     WEIGHTS,
     compute_elo_ratings,
     elo_win_prob,
+    evaluation_stats,
     extract_final_results,
+    format_evaluation,
     load_model,
     update_elo,
     build_pitcher_index,
@@ -613,6 +615,86 @@ class FormatTableTest(unittest.TestCase):
         self.assertIn("피타고리안", output)
         self.assertIn("선발 투수", output)
         self.assertIn("가중치", output)
+
+    def test_finished_game_marked_hit_or_miss(self):
+        # 다저스 홈승(5:3) 예측이 홈승이므로 '적중' 표시가 나와야 한다.
+        output = format_table(self.games, "2026-08-03")
+        self.assertIn("→ 적중", output)
+
+
+class EvaluationStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.games = parse_games(
+            SAMPLE_SCHEDULE,
+            build_standings_index(SAMPLE_STANDINGS),
+            build_pitcher_index(SAMPLE_PEOPLE),
+        )
+
+    def test_counts_only_finished_games(self):
+        stats = evaluation_stats(self.games)
+        self.assertEqual(stats["games"], 1)  # game1만 Final
+        self.assertEqual(stats["hits"], 1)   # 홈승 예측, 실제 홈승
+        self.assertEqual(stats["accuracy"], 1.0)
+        self.assertGreater(stats["log_loss"], 0.0)
+        self.assertLess(stats["brier"], 0.25)
+
+    def test_no_finished_games_returns_none(self):
+        scheduled_only = [g for g in self.games if "home_score" not in g]
+        self.assertIsNone(evaluation_stats(scheduled_only))
+
+    def test_tie_games_excluded(self):
+        tied = dict(self.games[0], home_score=4, away_score=4)
+        self.assertIsNone(evaluation_stats([tied]))
+
+    def test_miss_counted(self):
+        upset = dict(self.games[0], home_score=1, away_score=9)
+        stats = evaluation_stats([upset])
+        self.assertEqual(stats["hits"], 0)
+        self.assertEqual(stats["accuracy"], 0.0)
+
+    def test_format_evaluation_output(self):
+        text = format_evaluation(evaluation_stats(self.games))
+        self.assertIn("예측 검증", text)
+        self.assertIn("적중 1/1", text)
+
+
+class SeasonFromStandingsTest(unittest.TestCase):
+    def test_season_component_prefers_standings_record(self):
+        # standings 전적(전날 기준)이 leagueRecord(경기 후)와 다를 때
+        # standings 쪽을 써야 한다 — 과거 경기 예측의 미래 누수 방지.
+        standings = {
+            "records": [
+                {
+                    "teamRecords": [
+                        {
+                            "team": {"id": 119},
+                            "wins": 69, "losses": 40, "gamesPlayed": 109,
+                            "runsScored": 575, "runsAllowed": 448,
+                            "records": {"splitRecords": []},
+                        },
+                        {
+                            "team": {"id": 137},
+                            "wins": 60, "losses": 49, "gamesPlayed": 109,
+                            "runsScored": 497, "runsAllowed": 477,
+                            "records": {"splitRecords": []},
+                        },
+                    ]
+                }
+            ]
+        }
+        game = SAMPLE_SCHEDULE["dates"][0]["games"][0]
+        components = compute_components(game, build_standings_index(standings), {})
+        season = components[0]
+        self.assertEqual(season["name"], "season")
+        # 69/(109+33) 기반 보정 승률이 detail에 나와야 한다 (70승이 아니라 69승)
+        expected_home = (69 + 16.5) / (109 + 33)
+        self.assertIn(f"{expected_home:.3f}", season["detail"])
+
+    def test_falls_back_to_league_record_without_standings(self):
+        game = SAMPLE_SCHEDULE["dates"][0]["games"][0]
+        components = compute_components(game, {}, {})
+        expected_home = (70 + 16.5) / (110 + 33)
+        self.assertIn(f"{expected_home:.3f}", components[0]["detail"])
 
 
 if __name__ == "__main__":

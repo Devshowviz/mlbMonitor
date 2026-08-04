@@ -36,7 +36,17 @@ python mlb_win_rate.py --json
 # 과거 시즌으로 가중치 학습 → 이후 예측이 자동으로 학습된 가중치 사용
 python backtest.py --season 2025 --output weights.json
 python mlb_win_rate.py
+
+# 과거 날짜 범위를 예측하고 실제 결과와 비교 (적중률/로그손실/브라이어 요약)
+python mlb_win_rate.py --date 2026-08-01 --end-date 2026-08-03
 ```
+
+과거 날짜를 예측할 때는 미래 정보가 새지 않도록 standings를 **경기 전날 기준**으로
+조회하고(`date` 파라미터), 시즌 승률도 경기 후 전적(leagueRecord) 대신 전날 기준
+standings 전적을 사용합니다. Elo도 그 날짜 전까지의 결과만 재생합니다.
+끝난 경기에는 경기별 `→ 적중/빗나감` 표시와 전체 검증 요약이 붙습니다.
+(단, 선발 투수 스탯은 현재 시즌 누적치라 과거 날짜 기준으로는 약간의 누수가
+있습니다 — 시점별 복원이 어려운 API 한계입니다.)
 
 출력 예시 (`--detail`):
 

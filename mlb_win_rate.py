@@ -124,11 +124,16 @@ def fetch_schedule(game_date: str) -> dict:
     return _fetch_json(f"{API_BASE}/schedule?{params}")
 
 
-def fetch_standings(season: int) -> dict:
-    """AL/NL 전체 팀의 순위표(득실점, 홈/원정, 최근 10경기 포함)를 가져온다."""
-    params = urllib.parse.urlencode(
-        {"leagueId": "103,104", "season": season, "standingsTypes": "regularSeason"}
-    )
+def fetch_standings(season: int, as_of_date: str | None = None) -> dict:
+    """AL/NL 전체 팀의 순위표(득실점, 홈/원정, 최근 10경기 포함)를 가져온다.
+
+    as_of_date(YYYY-MM-DD)를 주면 그 날짜 종료 시점의 순위표를 가져온다.
+    과거 경기를 예측할 때 미래 정보가 새지 않도록 "경기 전날"을 넘긴다.
+    """
+    query = {"leagueId": "103,104", "season": season, "standingsTypes": "regularSeason"}
+    if as_of_date:
+        query["date"] = as_of_date
+    params = urllib.parse.urlencode(query)
     return _fetch_json(f"{API_BASE}/standings?{params}")
 
 
@@ -411,16 +416,23 @@ def compute_components(
     weights = weights or WEIGHTS
     components: list[dict] = []
 
-    # 1. 시즌 승률 log5 — schedule 응답의 leagueRecord만으로 항상 계산 가능.
+    home_standing = standings_index.get(home["team"]["id"])
+    away_standing = standings_index.get(away["team"]["id"])
+
+    # 1. 시즌 승률 log5 — standings(경기 전날 기준)가 있으면 그 전적을,
+    #    없으면 schedule의 leagueRecord를 쓴다. 과거 경기의 leagueRecord는
+    #    경기 후 전적이라 standings 쪽이 누수 없이 더 정확하다.
+    if home_standing and away_standing:
+        home_record = {"wins": home_standing["wins"], "losses": home_standing["losses"]}
+        away_record = {"wins": away_standing["wins"], "losses": away_standing["losses"]}
+    else:
+        home_record = home.get("leagueRecord", {})
+        away_record = away.get("leagueRecord", {})
     home_season = padded_rate(
-        home.get("leagueRecord", {}).get("wins", 0),
-        home.get("leagueRecord", {}).get("losses", 0),
-        PAD_SEASON,
+        home_record.get("wins", 0), home_record.get("losses", 0), PAD_SEASON
     )
     away_season = padded_rate(
-        away.get("leagueRecord", {}).get("wins", 0),
-        away.get("leagueRecord", {}).get("losses", 0),
-        PAD_SEASON,
+        away_record.get("wins", 0), away_record.get("losses", 0), PAD_SEASON
     )
     components.append(
         {
@@ -430,9 +442,6 @@ def compute_components(
             "detail": f"시즌 승률 {home_season:.3f} vs {away_season:.3f} (보정)",
         }
     )
-
-    home_standing = standings_index.get(home["team"]["id"])
-    away_standing = standings_index.get(away["team"]["id"])
 
     if home_standing and away_standing:
         # 2. 피타고리안 승률 log5
@@ -652,6 +661,10 @@ def format_table(games: list[dict], game_date: str, detail: bool = False) -> str
         score = ""
         if "away_score" in game:
             score = f" ({game['away_score']}:{game['home_score']})"
+            if game["away_score"] != game["home_score"]:
+                predicted_home = game["home_win_prob"] >= 0.5
+                actual_home = game["home_score"] > game["away_score"]
+                score += " → 적중" if predicted_home == actual_home else " → 빗나감"
         lines.append(
             f"{game['away_team']:<24} {game['away_record']:>7} | "
             f"{game['home_team']:<24} {game['home_record']:>7} | "
@@ -674,6 +687,49 @@ def format_table(games: list[dict], game_date: str, detail: bool = False) -> str
     return "\n".join(lines)
 
 
+def evaluation_stats(games: list[dict]) -> dict | None:
+    """끝난 경기들에 대해 예측 성능(적중률/로그손실/브라이어)을 계산한다."""
+    finished = [
+        game
+        for game in games
+        if "home_score" in game and game["home_score"] != game["away_score"]
+    ]
+    if not finished:
+        return None
+
+    hits = 0
+    total_log_loss = 0.0
+    total_brier = 0.0
+    for game in finished:
+        actual = 1 if game["home_score"] > game["away_score"] else 0
+        prob = min(max(game["home_win_prob"], 1e-12), 1 - 1e-12)
+        if (prob >= 0.5) == (actual == 1):
+            hits += 1
+        total_log_loss += -(
+            actual * math.log(prob) + (1 - actual) * math.log(1 - prob)
+        )
+        total_brier += (prob - actual) ** 2
+
+    count = len(finished)
+    return {
+        "games": count,
+        "hits": hits,
+        "accuracy": round(hits / count, 3),
+        "log_loss": round(total_log_loss / count, 4),
+        "brier": round(total_brier / count, 4),
+    }
+
+
+def format_evaluation(stats: dict) -> str:
+    return (
+        f"=== 예측 검증 (끝난 경기 {stats['games']}건) ===\n"
+        f"적중 {stats['hits']}/{stats['games']} ({stats['accuracy']:.1%})"
+        f"  로그손실 {stats['log_loss']:.4f}"
+        f"  브라이어 {stats['brier']:.4f}\n"
+        f"(참고: 동전던지기 로그손실 0.6931, 전적 기반 모델의 현실적 수준 ≈ 0.68)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
@@ -684,6 +740,12 @@ def main(argv: list[str] | None = None) -> int:
         "--date",
         default=date.today().isoformat(),
         help="조회할 날짜 (YYYY-MM-DD, 기본값: 오늘)",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="여러 날짜를 한 번에 예측할 때의 마지막 날짜 (YYYY-MM-DD)."
+        " 끝난 경기가 있으면 예측 검증 요약도 출력한다.",
     )
     parser.add_argument(
         "--detail", action="store_true", help="컴포넌트별 계산 근거도 출력"
@@ -697,7 +759,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    season = int(args.date[:4])
+    try:
+        start = date.fromisoformat(args.date)
+        end = date.fromisoformat(args.end_date) if args.end_date else start
+    except ValueError as error:
+        print(f"날짜 형식이 잘못됐습니다: {error}", file=sys.stderr)
+        return 1
+    if end < start:
+        print("--end-date는 --date보다 빠를 수 없습니다.", file=sys.stderr)
+        return 1
+
+    season = start.year
 
     # 결합 모델: 학습된 가중치 파일이 있으면 사용, 없으면 기본값.
     model = DEFAULT_MODEL
@@ -712,56 +784,82 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
+    # Elo용 시즌 결과는 범위 전체에 대해 한 번만 가져온다 (마지막 날 전날까지).
+    season_results: list[dict] = []
     try:
-        schedule = fetch_schedule(args.date)
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"MLB Stats API(schedule) 호출에 실패했습니다: {error}", file=sys.stderr)
-        return 1
-
-    # standings와 투수 스탯은 실패해도 schedule 기반 계산으로 계속 진행한다.
-    standings_index: dict[int, dict] = {}
-    try:
-        standings_index = build_standings_index(fetch_standings(season))
+        day_before_end = (end - timedelta(days=1)).isoformat()
+        season_results = fetch_season_results(season, day_before_end)
     except (urllib.error.URLError, TimeoutError, OSError, KeyError) as error:
-        print(
-            f"경고: standings 조회 실패 — 피타고리안/스플릿/폼 컴포넌트를 건너뜁니다: {error}",
-            file=sys.stderr,
-        )
-
-    pitcher_index: dict[int, dict] = {}
-    pitcher_ids = collect_probable_pitcher_ids(schedule)
-    if pitcher_ids:
-        try:
-            pitcher_index = build_pitcher_index(
-                fetch_pitcher_stats(pitcher_ids, season)
-            )
-        except (urllib.error.URLError, TimeoutError, OSError, KeyError) as error:
-            print(
-                f"경고: 투수 스탯 조회 실패 — 선발 투수 컴포넌트를 건너뜁니다: {error}",
-                file=sys.stderr,
-            )
-
-    # Elo: 전날까지의 시즌 결과를 재생해 레이팅을 계산한다.
-    elo_ratings: dict[int, float] = {}
-    try:
-        day_before = (date.fromisoformat(args.date) - timedelta(days=1)).isoformat()
-        elo_ratings = compute_elo_ratings(fetch_season_results(season, day_before))
-    except (urllib.error.URLError, TimeoutError, OSError, KeyError, ValueError) as error:
         print(
             f"경고: 시즌 결과 조회 실패 — Elo 컴포넌트를 건너뜁니다: {error}",
             file=sys.stderr,
         )
 
-    games = parse_games(schedule, standings_index, pitcher_index, elo_ratings, model)
+    all_games: list[dict] = []
+    outputs: list[str] = []
+    current = start
+    while current <= end:
+        game_date = current.isoformat()
+        try:
+            schedule = fetch_schedule(game_date)
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            print(
+                f"MLB Stats API(schedule, {game_date}) 호출에 실패했습니다: {error}",
+                file=sys.stderr,
+            )
+            return 1
+
+        # standings는 미래 정보가 새지 않도록 "경기 전날" 기준으로 가져온다.
+        standings_index: dict[int, dict] = {}
+        day_before = (current - timedelta(days=1)).isoformat()
+        try:
+            standings_index = build_standings_index(
+                fetch_standings(season, as_of_date=day_before)
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, KeyError) as error:
+            print(
+                f"경고: standings({day_before}) 조회 실패 — "
+                f"피타고리안/스플릿/폼 컴포넌트를 건너뜁니다: {error}",
+                file=sys.stderr,
+            )
+
+        pitcher_index: dict[int, dict] = {}
+        pitcher_ids = collect_probable_pitcher_ids(schedule)
+        if pitcher_ids:
+            try:
+                pitcher_index = build_pitcher_index(
+                    fetch_pitcher_stats(pitcher_ids, season)
+                )
+            except (urllib.error.URLError, TimeoutError, OSError, KeyError) as error:
+                print(
+                    f"경고: 투수 스탯 조회 실패 — 선발 투수 컴포넌트를 건너뜁니다: {error}",
+                    file=sys.stderr,
+                )
+
+        # Elo: 그 날짜 전까지의 결과만 재생한다.
+        elo_ratings = compute_elo_ratings(
+            [result for result in season_results if result["date"] < game_date]
+        )
+
+        games = parse_games(schedule, standings_index, pitcher_index, elo_ratings, model)
+        all_games.extend(games)
+        outputs.append(format_table(games, game_date, detail=args.detail))
+        current += timedelta(days=1)
+
+    stats = evaluation_stats(all_games)
 
     if args.json:
-        print(
-            json.dumps(
-                {"date": args.date, "games": games}, ensure_ascii=False, indent=2
-            )
-        )
+        payload = {"date": args.date, "games": all_games}
+        if args.end_date:
+            payload["end_date"] = args.end_date
+        if stats:
+            payload["evaluation"] = stats
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(format_table(games, args.date, detail=args.detail))
+        print("\n\n".join(outputs))
+        if stats:
+            print()
+            print(format_evaluation(stats))
     return 0
 
 
