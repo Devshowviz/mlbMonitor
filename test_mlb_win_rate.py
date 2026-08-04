@@ -15,11 +15,16 @@ from mlb_win_rate import (
     LEAGUE_AVG_FIP,
     WEIGHTS,
     compute_elo_ratings,
+    compute_markets,
     elo_win_prob,
     evaluation_stats,
     extract_final_results,
     format_evaluation,
+    league_runs_per_game,
     load_model,
+    market_probs,
+    matchup_expected_runs,
+    poisson_pmf,
     update_elo,
     build_pitcher_index,
     build_standings_index,
@@ -294,6 +299,79 @@ class PitcherTest(unittest.TestCase):
     def test_matchup_better_home_pitcher_favored(self):
         self.assertGreater(pitcher_matchup_prob(3.0, 4.5), 0.5)
         self.assertLess(pitcher_matchup_prob(4.5, 3.0), 0.5)
+
+
+# ---------------------------------------------------------------------------
+# 배당 시장 (핸디캡 / 언더오버)
+# ---------------------------------------------------------------------------
+
+class MarketTest(unittest.TestCase):
+    def test_poisson_pmf_sums_to_one(self):
+        total = sum(poisson_pmf(k, 4.5) for k in range(30))
+        self.assertAlmostEqual(total, 1.0, places=9)
+
+    def test_league_runs_per_game(self):
+        index = build_standings_index(SAMPLE_STANDINGS)
+        # (580+500) / (110+110) = 4.909...
+        self.assertAlmostEqual(league_runs_per_game(index), 1080 / 220, places=6)
+
+    def test_league_rpg_empty_falls_back(self):
+        self.assertEqual(league_runs_per_game({}), 4.5)
+
+    def test_matchup_expected_runs_formula(self):
+        home = {"runs_scored": 550, "runs_allowed": 440, "games": 110}   # 공 5.0 수 4.0
+        away = {"runs_scored": 440, "runs_allowed": 495, "games": 110}   # 공 4.0 수 4.5
+        mu_home, mu_away = matchup_expected_runs(home, away, 4.5)
+        # 홈 기대 득점 = 5.0 * 4.5 / 4.5 * 1.02 = 5.1
+        self.assertAlmostEqual(mu_home, 5.0 * 4.5 / 4.5 * 1.02, places=6)
+        # 원정 기대 득점 = 4.0 * 4.0 / 4.5 * 0.98
+        self.assertAlmostEqual(mu_away, 4.0 * 4.0 / 4.5 * 0.98, places=6)
+
+    def test_better_home_starter_lowers_away_runs(self):
+        home = {"runs_scored": 500, "runs_allowed": 450, "games": 110}
+        away = {"runs_scored": 500, "runs_allowed": 450, "games": 110}
+        _, away_with_ace = matchup_expected_runs(home, away, 4.5, home_fip=2.50)
+        _, away_baseline = matchup_expected_runs(home, away, 4.5)
+        self.assertLess(away_with_ace, away_baseline)
+
+    def test_market_probs_equal_teams(self):
+        probs = market_probs(4.5, 4.5)
+        self.assertAlmostEqual(probs["home_ml_prob"], 0.5, places=2)
+        # 런라인 커버는 승리보다 어렵다
+        self.assertLess(probs["home_runline_prob"], probs["home_ml_prob"])
+        # 양쪽 -1.5 커버 확률이 같아야 한다 (대칭)
+        self.assertAlmostEqual(
+            probs["home_runline_prob"], probs["away_runline_prob"], places=6
+        )
+        self.assertAlmostEqual(probs["over_prob"] + probs["under_prob"], 1.0, places=6)
+        self.assertEqual(probs["expected_total"], 9.0)
+
+    def test_market_probs_higher_total_more_over(self):
+        low = market_probs(3.5, 3.5)
+        high = market_probs(5.5, 5.5)
+        self.assertLess(low["over_prob"], high["over_prob"])
+
+    def test_market_probs_stronger_home_covers_more(self):
+        probs = market_probs(5.5, 3.5)
+        self.assertGreater(probs["home_ml_prob"], 0.6)
+        self.assertGreater(probs["home_runline_prob"], probs["away_runline_prob"])
+
+    def test_custom_lines(self):
+        probs = market_probs(4.5, 4.5, run_line=2.5, total_line=10.5)
+        base = market_probs(4.5, 4.5)
+        self.assertLess(probs["home_runline_prob"], base["home_runline_prob"])
+        self.assertLess(probs["over_prob"], base["over_prob"])
+
+    def test_compute_markets_requires_standings(self):
+        game = SAMPLE_SCHEDULE["dates"][0]["games"][0]
+        self.assertIsNone(compute_markets(game, {}, {}))
+        markets = compute_markets(
+            game, build_standings_index(SAMPLE_STANDINGS),
+            build_pitcher_index(SAMPLE_PEOPLE),
+        )
+        self.assertIsNotNone(markets)
+        self.assertIn("over_prob", markets)
+        self.assertGreater(markets["expected_total"], 5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +734,17 @@ class EvaluationStatsTest(unittest.TestCase):
         text = format_evaluation(evaluation_stats(self.games))
         self.assertIn("예측 검증", text)
         self.assertIn("적중 1/1", text)
+
+    def test_markets_evaluated_when_present(self):
+        stats = evaluation_stats(self.games)
+        # game1은 standings가 있어 markets가 붙는다 → 마켓 검증도 나와야 한다.
+        self.assertIn("runline", stats)
+        self.assertIn("over_under", stats)
+        self.assertEqual(stats["runline"]["games"], 1)
+        # 다저스 5:3 → 마진 2, 홈 -1.5 커버 성공
+        text = format_evaluation(stats)
+        self.assertIn("핸디캡", text)
+        self.assertIn("언더오버", text)
 
 
 class SeasonFromStandingsTest(unittest.TestCase):

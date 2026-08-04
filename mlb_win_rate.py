@@ -77,6 +77,14 @@ PYTHAGENPAT_EXPONENT = 0.287
 # 로그오즈 변환 시 확률 클램프 (0/1 근처에서 발산 방지)
 PROB_CLAMP = 0.01
 
+# 배당 시장(핸디캡/언더오버) 예측용 파라미터
+RUN_LINE_DEFAULT = 1.5        # 핸디캡 기준선 (MLB 표준 런라인)
+TOTAL_LINE_DEFAULT = 8.5      # 언더오버 기준선
+HOME_RUNS_FACTOR = 1.02       # 홈팀 득점 보정 (홈 어드밴티지의 득점 측면)
+AWAY_RUNS_FACTOR = 0.98       # 원정팀 득점 보정
+STARTER_INNINGS_SHARE = 0.55  # 선발 투수가 책임지는 이닝 비중 (FIP 보정에 사용)
+MAX_RUNS_GRID = 30            # 푸아송 점수 격자 상한 (그 이상 득점 확률은 무시 가능)
+
 # Elo 파라미터 (FiveThirtyEight MLB Elo에서 착안)
 ELO_INITIAL = 1500.0    # 시즌 시작 레이팅
 ELO_K = 4.0             # 경기당 레이팅 이동 폭
@@ -252,6 +260,155 @@ def pythagenpat(runs_scored: float, runs_allowed: float, games: float) -> float:
     rs_x = runs_scored ** exponent
     ra_x = runs_allowed ** exponent
     return rs_x / (rs_x + ra_x)
+
+
+# ---------------------------------------------------------------------------
+# 배당 시장 예측 (핸디캡 런라인, 언더오버)
+# ---------------------------------------------------------------------------
+
+def poisson_pmf(k: int, mu: float) -> float:
+    """평균 mu인 푸아송 분포에서 정확히 k득점할 확률."""
+    return math.exp(-mu) * mu**k / math.factorial(k)
+
+
+def league_runs_per_game(standings_index: dict[int, dict]) -> float:
+    """standings에서 리그 전체 팀당 경기당 평균 득점을 계산한다."""
+    total_runs = sum(team["runs_scored"] for team in standings_index.values())
+    total_games = sum(team["games"] for team in standings_index.values())
+    if total_games == 0:
+        return 4.5  # 시즌 개막 전이면 역사적 평균 근사값
+    return total_runs / total_games
+
+
+def matchup_expected_runs(
+    home_standing: dict,
+    away_standing: dict,
+    league_rpg: float,
+    home_fip: float | None = None,
+    away_fip: float | None = None,
+) -> tuple[float, float]:
+    """두 팀의 이 경기 기대 득점 (홈, 원정)을 추정한다.
+
+    기본 공식(Bill James 매치업): 기대 득점 = 공격력 × 상대 수비력 ÷ 리그 평균.
+    여기에 상대 선발 FIP 보정(선발이 STARTER_INNINGS_SHARE 만큼의 이닝을
+    책임진다고 보고 리그 평균 FIP 대비 비율로 조정)과 홈/원정 득점 보정을 곱한다.
+    """
+
+    def _rate(runs: float, games: float) -> float:
+        return runs / games if games > 0 else league_rpg
+
+    home_offense = _rate(home_standing["runs_scored"], home_standing["games"])
+    home_defense = _rate(home_standing["runs_allowed"], home_standing["games"])
+    away_offense = _rate(away_standing["runs_scored"], away_standing["games"])
+    away_defense = _rate(away_standing["runs_allowed"], away_standing["games"])
+
+    def _pitcher_factor(fip: float | None) -> float:
+        if fip is None:
+            return 1.0
+        return STARTER_INNINGS_SHARE * (fip / LEAGUE_AVG_FIP) + (
+            1.0 - STARTER_INNINGS_SHARE
+        )
+
+    # 홈팀 득점은 원정팀 수비(＋원정 선발), 원정팀 득점은 홈팀 수비(＋홈 선발)에 달려 있다.
+    mu_home = (
+        home_offense * away_defense / league_rpg
+        * _pitcher_factor(away_fip)
+        * HOME_RUNS_FACTOR
+    )
+    mu_away = (
+        away_offense * home_defense / league_rpg
+        * _pitcher_factor(home_fip)
+        * AWAY_RUNS_FACTOR
+    )
+    return max(mu_home, 0.1), max(mu_away, 0.1)
+
+
+def market_probs(
+    mu_home: float,
+    mu_away: float,
+    run_line: float = RUN_LINE_DEFAULT,
+    total_line: float = TOTAL_LINE_DEFAULT,
+) -> dict:
+    """기대 득점으로 핸디캡/언더오버/머니라인 확률을 계산한다.
+
+    두 팀 득점을 독립 푸아송으로 두고 점수 조합 격자를 전부 더한다.
+    야구는 무승부가 없으므로 동점 질량은 연장전(대부분 1점차 승부)으로
+    해소된다고 보고 두 팀 승리 확률 비율로 나눠 배분한다 — 머니라인에만
+    영향을 주고, 핸디캡(±1.5) 커버 여부는 동점 해소로 2점차 이상이 되지
+    않으므로 격자 값을 그대로 쓴다.
+    """
+    home_pmf = [poisson_pmf(k, mu_home) for k in range(MAX_RUNS_GRID)]
+    away_pmf = [poisson_pmf(k, mu_away) for k in range(MAX_RUNS_GRID)]
+
+    p_home_win = p_away_win = p_tie = 0.0
+    p_home_cover = p_away_cover = p_over = 0.0
+    for h, ph in enumerate(home_pmf):
+        for a, pa in enumerate(away_pmf):
+            p = ph * pa
+            margin = h - a
+            if margin > 0:
+                p_home_win += p
+            elif margin < 0:
+                p_away_win += p
+            else:
+                p_tie += p
+            if margin > run_line:
+                p_home_cover += p
+            if -margin > run_line:
+                p_away_cover += p
+            if h + a > total_line:
+                p_over += p
+
+    decided = p_home_win + p_away_win
+    home_share = p_home_win / decided if decided > 0 else 0.5
+    home_ml = p_home_win + p_tie * home_share
+
+    return {
+        "expected_home_runs": round(mu_home, 2),
+        "expected_away_runs": round(mu_away, 2),
+        "expected_total": round(mu_home + mu_away, 2),
+        "run_line": run_line,
+        "total_line": total_line,
+        "home_ml_prob": round(home_ml, 3),
+        # 홈팀 -run_line 커버 확률과 원정팀 -run_line 커버 확률.
+        # (+run_line 쪽 확률은 각각 1 - 반대편 커버 확률)
+        "home_runline_prob": round(p_home_cover, 3),
+        "away_runline_prob": round(p_away_cover, 3),
+        "over_prob": round(p_over, 3),
+        "under_prob": round(1.0 - p_over, 3),
+    }
+
+
+def compute_markets(
+    game: dict,
+    standings_index: dict[int, dict],
+    pitcher_index: dict[int, dict],
+    run_line: float = RUN_LINE_DEFAULT,
+    total_line: float = TOTAL_LINE_DEFAULT,
+) -> dict | None:
+    """한 경기의 배당 시장 예측을 계산한다. standings가 없으면 None."""
+    home = game["teams"]["home"]
+    away = game["teams"]["away"]
+    home_standing = standings_index.get(home["team"]["id"])
+    away_standing = standings_index.get(away["team"]["id"])
+    if not home_standing or not away_standing:
+        return None
+    if home_standing["games"] == 0 or away_standing["games"] == 0:
+        return None
+
+    home_pitcher_id = home.get("probablePitcher", {}).get("id")
+    away_pitcher_id = away.get("probablePitcher", {}).get("id")
+    home_fip = pitcher_index.get(home_pitcher_id, {}).get("fip") if home_pitcher_id else None
+    away_fip = pitcher_index.get(away_pitcher_id, {}).get("fip") if away_pitcher_id else None
+
+    mu_home, mu_away = matchup_expected_runs(
+        home_standing,
+        away_standing,
+        league_runs_per_game(standings_index),
+        home_fip,
+        away_fip,
+    )
+    return market_probs(mu_home, mu_away, run_line, total_line)
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +724,8 @@ def parse_games(
     pitcher_index: dict[int, dict] | None = None,
     elo_ratings: dict[int, float] | None = None,
     model: dict | None = None,
+    run_line: float = RUN_LINE_DEFAULT,
+    total_line: float = TOTAL_LINE_DEFAULT,
 ) -> list[dict]:
     """schedule 응답에서 경기별 승률 정보를 계산한다."""
     standings_index = standings_index or {}
@@ -582,6 +741,9 @@ def parse_games(
                 game, standings_index, pitcher_index, elo_ratings, model["weights"]
             )
             home_win_prob = combine_components(components, model)
+            markets = compute_markets(
+                game, standings_index, pitcher_index, run_line, total_line
+            )
 
             row = {
                 "away_team": away["team"]["name"],
@@ -606,6 +768,8 @@ def parse_games(
                 "away_pitcher": away.get("probablePitcher", {}).get("fullName", ""),
                 "home_pitcher": home.get("probablePitcher", {}).get("fullName", ""),
             }
+            if markets:
+                row["markets"] = markets
 
             # 이미 끝났거나 진행 중인 경기는 점수도 함께 담는다.
             if "score" in away and "score" in home:
@@ -676,6 +840,17 @@ def format_table(games: list[dict], game_date: str, detail: bool = False) -> str
                 f"    선발: {game['away_pitcher'] or '미정'}"
                 f" vs {game['home_pitcher'] or '미정'}"
             )
+        markets = game.get("markets")
+        if markets:
+            lines.append(
+                f"    마켓: 예상 득점 {markets['expected_away_runs']:.1f}:"
+                f"{markets['expected_home_runs']:.1f}"
+                f" (합 {markets['expected_total']:.1f})"
+                f" | 오버 {markets['total_line']}: {markets['over_prob']:.1%}"
+                f" / 언더: {markets['under_prob']:.1%}"
+                f" | 핸디캡 홈 -{markets['run_line']}: {markets['home_runline_prob']:.1%}"
+                f" / 원정 -{markets['run_line']}: {markets['away_runline_prob']:.1%}"
+            )
         if detail:
             for component in game["components"]:
                 label = COMPONENT_LABELS.get(component["name"], component["name"])
@@ -711,7 +886,7 @@ def evaluation_stats(games: list[dict]) -> dict | None:
         total_brier += (prob - actual) ** 2
 
     count = len(finished)
-    return {
+    stats = {
         "games": count,
         "hits": hits,
         "accuracy": round(hits / count, 3),
@@ -719,15 +894,66 @@ def evaluation_stats(games: list[dict]) -> dict | None:
         "brier": round(total_brier / count, 4),
     }
 
+    # 마켓 예측(핸디캡/언더오버)도 실제 점수로 검증한다 (브라이어 점수).
+    runline_brier = runline_hits = runline_count = 0
+    over_brier = over_hits = over_count = 0
+    for game in finished:
+        markets = game.get("markets")
+        if not markets:
+            continue
+        margin = game["home_score"] - game["away_score"]
+        total = game["home_score"] + game["away_score"]
+
+        actual_cover = 1 if margin > markets["run_line"] else 0
+        runline_brier += (markets["home_runline_prob"] - actual_cover) ** 2
+        if (markets["home_runline_prob"] >= 0.5) == (actual_cover == 1):
+            runline_hits += 1
+        runline_count += 1
+
+        if total != markets["total_line"]:  # 정수 기준선의 푸시(동률)는 제외
+            actual_over = 1 if total > markets["total_line"] else 0
+            over_brier += (markets["over_prob"] - actual_over) ** 2
+            if (markets["over_prob"] >= 0.5) == (actual_over == 1):
+                over_hits += 1
+            over_count += 1
+
+    if runline_count:
+        stats["runline"] = {
+            "games": runline_count,
+            "accuracy": round(runline_hits / runline_count, 3),
+            "brier": round(runline_brier / runline_count, 4),
+        }
+    if over_count:
+        stats["over_under"] = {
+            "games": over_count,
+            "accuracy": round(over_hits / over_count, 3),
+            "brier": round(over_brier / over_count, 4),
+        }
+    return stats
+
 
 def format_evaluation(stats: dict) -> str:
-    return (
-        f"=== 예측 검증 (끝난 경기 {stats['games']}건) ===\n"
-        f"적중 {stats['hits']}/{stats['games']} ({stats['accuracy']:.1%})"
-        f"  로그손실 {stats['log_loss']:.4f}"
-        f"  브라이어 {stats['brier']:.4f}\n"
-        f"(참고: 동전던지기 로그손실 0.6931, 전적 기반 모델의 현실적 수준 ≈ 0.68)"
+    lines = [
+        f"=== 예측 검증 (끝난 경기 {stats['games']}건) ===",
+        f"승패     적중 {stats['hits']}/{stats['games']} ({stats['accuracy']:.1%})"
+        f"  로그손실 {stats['log_loss']:.4f}  브라이어 {stats['brier']:.4f}",
+    ]
+    if "runline" in stats:
+        runline = stats["runline"]
+        lines.append(
+            f"핸디캡   적중률 {runline['accuracy']:.1%}"
+            f"  브라이어 {runline['brier']:.4f} ({runline['games']}건, 홈 -1.5 기준)"
+        )
+    if "over_under" in stats:
+        over_under = stats["over_under"]
+        lines.append(
+            f"언더오버 적중률 {over_under['accuracy']:.1%}"
+            f"  브라이어 {over_under['brier']:.4f} ({over_under['games']}건)"
+        )
+    lines.append(
+        "(참고: 동전던지기 로그손실 0.6931, 전적 기반 모델의 현실적 수준 ≈ 0.68)"
     )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +975,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--detail", action="store_true", help="컴포넌트별 계산 근거도 출력"
+    )
+    parser.add_argument(
+        "--run-line",
+        type=float,
+        default=RUN_LINE_DEFAULT,
+        help=f"핸디캡 기준선 (기본값: {RUN_LINE_DEFAULT})",
+    )
+    parser.add_argument(
+        "--total-line",
+        type=float,
+        default=TOTAL_LINE_DEFAULT,
+        help=f"언더오버 기준선 (기본값: {TOTAL_LINE_DEFAULT})",
     )
     parser.add_argument("--json", action="store_true", help="표 대신 JSON으로 출력")
     parser.add_argument(
@@ -841,7 +1079,15 @@ def main(argv: list[str] | None = None) -> int:
             [result for result in season_results if result["date"] < game_date]
         )
 
-        games = parse_games(schedule, standings_index, pitcher_index, elo_ratings, model)
+        games = parse_games(
+            schedule,
+            standings_index,
+            pitcher_index,
+            elo_ratings,
+            model,
+            run_line=args.run_line,
+            total_line=args.total_line,
+        )
         all_games.extend(games)
         outputs.append(format_table(games, game_date, detail=args.detail))
         current += timedelta(days=1)
