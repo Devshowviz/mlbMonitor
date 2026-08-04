@@ -392,12 +392,16 @@ def run_backtest(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MLB 승률 앙상블 가중치 백테스트")
-    parser.add_argument("--season", type=int, default=None, help="백테스트할 시즌 (예: 2025)")
+    parser.add_argument(
+        "--season",
+        default=None,
+        help="백테스트할 시즌. 단일(2025), 범위(2021-2025),"
+        " 목록(2021,2023,2025) 모두 가능. 2020은 단축 시즌이라 제외를 권장.",
+    )
     parser.add_argument(
         "--seasons",
         default=None,
-        help="여러 시즌 학습 (예: 2021-2025 또는 2021,2023,2025)."
-        " 2020은 단축 시즌이라 제외를 권장. --season과 둘 중 하나만 지정.",
+        help="--season과 동일 (별칭)",
     )
     parser.add_argument(
         "--end-date",
@@ -420,13 +424,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if bool(args.season) == bool(args.seasons):
+    season_arg = args.season or args.seasons
+    if not season_arg or (args.season and args.seasons):
         print("--season 또는 --seasons 중 하나만 지정하세요.", file=sys.stderr)
         return 1
     try:
-        seasons = parse_seasons(args.seasons) if args.seasons else [args.season]
+        seasons = parse_seasons(str(season_arg))
     except ValueError as error:
-        print(str(error), file=sys.stderr)
+        print(f"시즌을 해석할 수 없습니다: {error}", file=sys.stderr)
         return 1
     if 2020 in seasons:
         print(
