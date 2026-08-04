@@ -4,12 +4,21 @@ MLB Stats API 실제 응답 구조를 본뜬 샘플 데이터로
 각 컴포넌트 계산과 앙상블 결합 로직을 검증한다.
 """
 
+import json
+import os
+import tempfile
 import unittest
 
 from mlb_win_rate import (
+    ELO_INITIAL,
     HOME_ADVANTAGE_LOGIT,
     LEAGUE_AVG_FIP,
     WEIGHTS,
+    compute_elo_ratings,
+    elo_win_prob,
+    extract_final_results,
+    load_model,
+    update_elo,
     build_pitcher_index,
     build_standings_index,
     collect_probable_pitcher_ids,
@@ -286,6 +295,144 @@ class PitcherTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Elo
+# ---------------------------------------------------------------------------
+
+class EloTest(unittest.TestCase):
+    def _result(self, home_score, away_score):
+        return {
+            "date": "2026-08-01",
+            "home_id": 1,
+            "away_id": 2,
+            "home_score": home_score,
+            "away_score": away_score,
+        }
+
+    def test_equal_ratings_neutral_prob_is_half(self):
+        self.assertAlmostEqual(elo_win_prob(1500, 1500), 0.5)
+
+    def test_higher_rating_favored(self):
+        self.assertGreater(elo_win_prob(1550, 1450), 0.5)
+        self.assertAlmostEqual(
+            elo_win_prob(1550, 1450) + elo_win_prob(1450, 1550), 1.0
+        )
+
+    def test_home_win_raises_home_rating(self):
+        ratings = {}
+        update_elo(ratings, self._result(5, 3))
+        self.assertGreater(ratings[1], ELO_INITIAL)
+        self.assertLess(ratings[2], ELO_INITIAL)
+
+    def test_rating_change_is_zero_sum(self):
+        ratings = {1: 1520.0, 2: 1480.0}
+        update_elo(ratings, self._result(2, 9))
+        self.assertAlmostEqual(ratings[1] + ratings[2], 3000.0, places=9)
+
+    def test_blowout_moves_more_than_close_game(self):
+        close, blowout = {}, {}
+        update_elo(close, self._result(4, 3))
+        update_elo(blowout, self._result(10, 0))
+        self.assertGreater(blowout[1] - ELO_INITIAL, close[1] - ELO_INITIAL)
+
+    def test_upset_moves_more_than_expected_win(self):
+        # 약팀(1400)이 강팀(1600)을 이기면 크게, 강팀이 이기면 조금 움직인다.
+        upset = {1: 1400.0, 2: 1600.0}
+        update_elo(upset, self._result(5, 3))
+        expected = {1: 1600.0, 2: 1400.0}
+        update_elo(expected, self._result(5, 3))
+        self.assertGreater(upset[1] - 1400.0, expected[1] - 1600.0)
+
+    def test_compute_elo_ratings_orders_by_date(self):
+        results = [
+            {"date": "2026-05-02", "home_id": 1, "away_id": 2,
+             "home_score": 1, "away_score": 2},
+            {"date": "2026-05-01", "home_id": 1, "away_id": 2,
+             "home_score": 5, "away_score": 0},
+        ]
+        ratings = compute_elo_ratings(results)
+        self.assertEqual(set(ratings), {1, 2})
+
+
+class ExtractResultsTest(unittest.TestCase):
+    def test_extracts_only_final_games_with_scores(self):
+        schedule = {
+            "dates": [
+                {
+                    "date": "2026-08-01",
+                    "games": [
+                        {
+                            "status": {"abstractGameState": "Final"},
+                            "teams": {
+                                "away": {"team": {"id": 2}, "score": 3},
+                                "home": {"team": {"id": 1}, "score": 5},
+                            },
+                        },
+                        {
+                            "status": {"abstractGameState": "Preview"},
+                            "teams": {
+                                "away": {"team": {"id": 4}},
+                                "home": {"team": {"id": 3}},
+                            },
+                        },
+                        {
+                            # 동점(서스펜디드)은 제외돼야 한다
+                            "status": {"abstractGameState": "Final"},
+                            "teams": {
+                                "away": {"team": {"id": 6}, "score": 2},
+                                "home": {"team": {"id": 5}, "score": 2},
+                            },
+                        },
+                    ],
+                }
+            ]
+        }
+        results = extract_final_results(schedule)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["home_id"], 1)
+        self.assertEqual(results[0]["home_score"], 5)
+
+
+# ---------------------------------------------------------------------------
+# 가중치 파일 로딩
+# ---------------------------------------------------------------------------
+
+class LoadModelTest(unittest.TestCase):
+    def _write(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        )
+        json.dump(data, handle)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_loads_valid_model(self):
+        path = self._write(
+            {"weights": {"season": 0.5, "elo": 0.5}, "scale": 2.0, "intercept": 0.12}
+        )
+        model = load_model(path)
+        self.assertEqual(model["weights"]["elo"], 0.5)
+        self.assertEqual(model["scale"], 2.0)
+        self.assertEqual(model["intercept"], 0.12)
+
+    def test_missing_optional_fields_get_defaults(self):
+        path = self._write({"weights": {"season": 1.0}})
+        model = load_model(path)
+        self.assertEqual(model["scale"], 1.0)
+        self.assertEqual(model["intercept"], HOME_ADVANTAGE_LOGIT)
+
+    def test_negative_weight_rejected(self):
+        path = self._write({"weights": {"season": -0.2}})
+        with self.assertRaises(ValueError):
+            load_model(path)
+
+    def test_empty_weights_rejected(self):
+        path = self._write({"weights": {}})
+        with self.assertRaises(ValueError):
+            load_model(path)
+
+
+# ---------------------------------------------------------------------------
 # 인덱싱
 # ---------------------------------------------------------------------------
 
@@ -328,6 +475,33 @@ class ComponentsTest(unittest.TestCase):
     def test_missing_standings_and_pitchers_only_season(self):
         components = compute_components(self.game2, self.standings, self.pitchers)
         self.assertEqual([c["name"] for c in components], ["season"])
+
+    def test_elo_ratings_add_sixth_component(self):
+        elo = {119: 1560.0, 137: 1490.0}
+        components = compute_components(
+            self.game1, self.standings, self.pitchers, elo_ratings=elo
+        )
+        names = [component["name"] for component in components]
+        self.assertEqual(
+            names, ["season", "pythagorean", "split", "form", "pitcher", "elo"]
+        )
+        elo_component = components[-1]
+        self.assertGreater(elo_component["prob"], 0.5)  # 다저스 레이팅 우위
+
+    def test_custom_weights_are_applied(self):
+        custom = dict(WEIGHTS, season=0.99)
+        components = compute_components(
+            self.game2, self.standings, self.pitchers, weights=custom
+        )
+        self.assertEqual(components[0]["weight"], 0.99)
+
+    def test_learned_model_scale_and_intercept_used(self):
+        component = {"name": "season", "prob": 0.6, "weight": 1.0, "detail": ""}
+        model = {"weights": {"season": 1.0}, "scale": 2.0, "intercept": 0.0}
+        expected = sigmoid(2.0 * logit(0.6))
+        self.assertAlmostEqual(
+            combine_components([component], model), expected, places=9
+        )
 
     def test_all_components_favor_dodgers(self):
         # 샘플 데이터에서 다저스가 전 지표 우위 → 모든 컴포넌트 > 0.5

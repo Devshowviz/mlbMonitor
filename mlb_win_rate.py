@@ -10,16 +10,19 @@ MLB Stats API(https://statsapi.mlb.com)에서 얻을 수 있는 데이터를 총
   3. split       홈팀의 홈 성적 vs 원정팀의 원정 성적 log5
   4. form        최근 10경기 승률 log5
   5. pitcher     예고 선발 투수의 FIP 비교
+  6. elo         시즌 경기 결과를 재생해 계산한 Elo 레이팅
   + 홈 어드밴티지 보정
 
 각 컴포넌트가 내놓은 홈팀 승리 확률을 로그오즈(log-odds) 공간에서
 가중 평균하고, 데이터가 없는 컴포넌트는 제외한 뒤 가중치를 재정규화한다.
+backtest.py로 학습한 가중치(weights.json)가 있으면 그것을 사용한다.
 
 사용 예:
     python mlb_win_rate.py                    # 오늘 날짜 경기
     python mlb_win_rate.py --date 2026-08-03
     python mlb_win_rate.py --detail           # 컴포넌트별 상세 출력
     python mlb_win_rate.py --json             # JSON으로 출력
+    python mlb_win_rate.py --weights weights.json  # 학습된 가중치 사용
 """
 
 from __future__ import annotations
@@ -27,11 +30,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date
+from datetime import date, timedelta
 
 API_BASE = "https://statsapi.mlb.com/api/v1"
 
@@ -39,13 +43,15 @@ API_BASE = "https://statsapi.mlb.com/api/v1"
 # 모델 파라미터
 # ---------------------------------------------------------------------------
 
-# 컴포넌트별 가중치. 데이터가 없는 컴포넌트는 빼고 나머지로 재정규화한다.
+# 컴포넌트별 기본 가중치. 데이터가 없는 컴포넌트는 빼고 나머지로 재정규화한다.
+# backtest.py로 학습한 weights.json이 있으면 그 값으로 대체된다.
 WEIGHTS = {
-    "season": 0.15,       # 시즌 승률 log5
-    "pythagorean": 0.25,  # 득실점 기반 피타고리안 log5
-    "split": 0.15,        # 홈/원정 스플릿 log5
+    "season": 0.10,       # 시즌 승률 log5
+    "pythagorean": 0.20,  # 득실점 기반 피타고리안 log5
+    "split": 0.10,        # 홈/원정 스플릿 log5
     "form": 0.10,         # 최근 10경기 log5
-    "pitcher": 0.35,      # 선발 투수 FIP 매치업
+    "pitcher": 0.30,      # 선발 투수 FIP 매치업
+    "elo": 0.20,          # Elo 레이팅
 }
 
 # 홈 어드밴티지: 로그오즈에 더하는 상수. 0.10 ≈ 승률 +2.5%p.
@@ -70,6 +76,34 @@ PYTHAGENPAT_EXPONENT = 0.287
 
 # 로그오즈 변환 시 확률 클램프 (0/1 근처에서 발산 방지)
 PROB_CLAMP = 0.01
+
+# Elo 파라미터 (FiveThirtyEight MLB Elo에서 착안)
+ELO_INITIAL = 1500.0    # 시즌 시작 레이팅
+ELO_K = 4.0             # 경기당 레이팅 이동 폭
+ELO_HOME_ADV = 24.0     # 레이팅 업데이트 시 홈팀에 더해주는 점수
+ELO_MOV_EXPONENT = 0.7  # 점수차(margin of victory) 반영 지수
+
+# 최종 결합 모델: 가중 평균 로그오즈에 scale을 곱하고 intercept(홈 어드밴티지)를
+# 더한다. backtest.py가 학습해서 덮어쓸 수 있는 구조.
+DEFAULT_MODEL = {
+    "weights": WEIGHTS,
+    "scale": 1.0,
+    "intercept": HOME_ADVANTAGE_LOGIT,
+}
+
+
+def load_model(path: str) -> dict:
+    """backtest.py가 저장한 weights.json을 읽어 결합 모델을 만든다."""
+    with open(path, encoding="utf-8") as file:
+        data = json.load(file)
+    weights = data.get("weights", {})
+    if not weights or any(weight < 0 for weight in weights.values()):
+        raise ValueError(f"weights.json의 가중치가 올바르지 않습니다: {weights}")
+    return {
+        "weights": weights,
+        "scale": float(data.get("scale", 1.0)),
+        "intercept": float(data.get("intercept", HOME_ADVANTAGE_LOGIT)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +143,46 @@ def fetch_pitcher_stats(person_ids: list[int], season: int) -> dict:
         }
     )
     return _fetch_json(f"{API_BASE}/people?{params}")
+
+
+def fetch_season_results(season: int, end_date: str) -> list[dict]:
+    """시즌 시작부터 end_date(포함)까지 정규시즌 최종 결과를 가져온다."""
+    params = urllib.parse.urlencode(
+        {
+            "sportId": 1,
+            "startDate": f"{season}-01-01",
+            "endDate": end_date,
+            "gameType": "R",
+        }
+    )
+    schedule = _fetch_json(f"{API_BASE}/schedule?{params}")
+    return extract_final_results(schedule)
+
+
+def extract_final_results(schedule: dict) -> list[dict]:
+    """schedule 응답에서 끝난 경기의 결과만 시간순으로 뽑아낸다."""
+    results = []
+    for day in schedule.get("dates", []):
+        for game in day.get("games", []):
+            if game.get("status", {}).get("abstractGameState") != "Final":
+                continue
+            away = game["teams"]["away"]
+            home = game["teams"]["home"]
+            if "score" not in away or "score" not in home:
+                continue
+            if away["score"] == home["score"]:  # 서스펜디드 등 무승부는 제외
+                continue
+            results.append(
+                {
+                    "date": day.get("date", ""),
+                    "home_id": home["team"]["id"],
+                    "away_id": away["team"]["id"],
+                    "home_score": home["score"],
+                    "away_score": away["score"],
+                }
+            )
+    results.sort(key=lambda result: result["date"])
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +247,52 @@ def pythagenpat(runs_scored: float, runs_allowed: float, games: float) -> float:
     rs_x = runs_scored ** exponent
     ra_x = runs_allowed ** exponent
     return rs_x / (rs_x + ra_x)
+
+
+# ---------------------------------------------------------------------------
+# Elo 레이팅
+# ---------------------------------------------------------------------------
+
+def elo_win_prob(home_elo: float, away_elo: float) -> float:
+    """구장 중립 기준으로 홈팀이 이길 확률. (홈 어드밴티지는 결합 단계에서 반영)"""
+    return 1.0 / (1.0 + 10.0 ** (-(home_elo - away_elo) / 400.0))
+
+
+def update_elo(ratings: dict[int, float], result: dict) -> None:
+    """한 경기 결과로 두 팀의 Elo를 갱신한다.
+
+    - 업데이트 기대값 계산에는 홈 어드밴티지(ELO_HOME_ADV)를 반영한다.
+    - 점수차가 클수록, 그리고 약팀이 이겼을수록 레이팅이 크게 움직인다
+      (FiveThirtyEight의 margin-of-victory 배수 방식).
+    """
+    home = ratings.setdefault(result["home_id"], ELO_INITIAL)
+    away = ratings.setdefault(result["away_id"], ELO_INITIAL)
+
+    expected_home = 1.0 / (
+        1.0 + 10.0 ** (-((home + ELO_HOME_ADV) - away) / 400.0)
+    )
+    home_won = result["home_score"] > result["away_score"]
+    actual_home = 1.0 if home_won else 0.0
+
+    margin = abs(result["home_score"] - result["away_score"])
+    winner_elo_diff = (
+        (home + ELO_HOME_ADV) - away if home_won else away - (home + ELO_HOME_ADV)
+    )
+    mov_multiplier = ((margin + 1) ** ELO_MOV_EXPONENT) / (
+        7.5 + 0.006 * winner_elo_diff
+    )
+
+    delta = ELO_K * mov_multiplier * (actual_home - expected_home)
+    ratings[result["home_id"]] = home + delta
+    ratings[result["away_id"]] = away - delta
+
+
+def compute_elo_ratings(results: list[dict]) -> dict[int, float]:
+    """시즌 경기 결과를 시간순으로 재생해 팀별 Elo 레이팅을 계산한다."""
+    ratings: dict[int, float] = {}
+    for result in sorted(results, key=lambda r: r["date"]):
+        update_elo(ratings, result)
+    return ratings
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +401,14 @@ def compute_components(
     game: dict,
     standings_index: dict[int, dict],
     pitcher_index: dict[int, dict],
+    elo_ratings: dict[int, float] | None = None,
+    weights: dict[str, float] | None = None,
 ) -> list[dict]:
     """한 경기에 대해 사용 가능한 모든 컴포넌트의 홈팀 승리 확률을 계산한다."""
     away = game["teams"]["away"]
     home = game["teams"]["home"]
+    elo_ratings = elo_ratings or {}
+    weights = weights or WEIGHTS
     components: list[dict] = []
 
     # 1. 시즌 승률 log5 — schedule 응답의 leagueRecord만으로 항상 계산 가능.
@@ -302,7 +426,7 @@ def compute_components(
         {
             "name": "season",
             "prob": log5(home_season, away_season),
-            "weight": WEIGHTS["season"],
+            "weight": weights.get("season", 0.0),
             "detail": f"시즌 승률 {home_season:.3f} vs {away_season:.3f} (보정)",
         }
     )
@@ -326,7 +450,7 @@ def compute_components(
             {
                 "name": "pythagorean",
                 "prob": log5(home_pyth, away_pyth),
-                "weight": WEIGHTS["pythagorean"],
+                "weight": weights.get("pythagorean", 0.0),
                 "detail": f"피타고리안 {home_pyth:.3f} vs {away_pyth:.3f}",
             }
         )
@@ -347,7 +471,7 @@ def compute_components(
                 {
                     "name": "split",
                     "prob": log5(home_split, away_split),
-                    "weight": WEIGHTS["split"],
+                    "weight": weights.get("split", 0.0),
                     "detail": f"홈 성적 {home_split:.3f} vs 원정 성적 {away_split:.3f} (보정)",
                 }
             )
@@ -368,7 +492,7 @@ def compute_components(
                 {
                     "name": "form",
                     "prob": log5(home_form, away_form),
-                    "weight": WEIGHTS["form"],
+                    "weight": weights.get("form", 0.0),
                     "detail": f"최근 10경기 {home_form:.3f} vs {away_form:.3f} (보정)",
                 }
             )
@@ -383,7 +507,7 @@ def compute_components(
             {
                 "name": "pitcher",
                 "prob": pitcher_matchup_prob(home_pitcher["fip"], away_pitcher["fip"]),
-                "weight": WEIGHTS["pitcher"],
+                "weight": weights.get("pitcher", 0.0),
                 "detail": (
                     f"{home_pitcher['name']} FIP {home_pitcher['fip']:.2f}"
                     f" vs {away_pitcher['name']} FIP {away_pitcher['fip']:.2f}"
@@ -391,22 +515,37 @@ def compute_components(
             }
         )
 
+    # 6. Elo 레이팅
+    home_elo = elo_ratings.get(home["team"]["id"])
+    away_elo = elo_ratings.get(away["team"]["id"])
+    if home_elo is not None and away_elo is not None:
+        components.append(
+            {
+                "name": "elo",
+                "prob": elo_win_prob(home_elo, away_elo),
+                "weight": weights.get("elo", 0.0),
+                "detail": f"Elo {home_elo:.0f} vs {away_elo:.0f}",
+            }
+        )
+
     return components
 
 
-def combine_components(components: list[dict]) -> float:
-    """컴포넌트들을 로그오즈 가중 평균으로 결합하고 홈 어드밴티지를 더한다.
+def combine_components(components: list[dict], model: dict | None = None) -> float:
+    """컴포넌트들을 로그오즈 가중 평균으로 결합해 최종 확률을 만든다.
 
+    최종 로그오즈 = scale × (가중 평균 로그오즈) + intercept(홈 어드밴티지).
     데이터가 없어 빠진 컴포넌트는 남은 가중치로 재정규화된다.
     """
+    model = model or DEFAULT_MODEL
     total_weight = sum(component["weight"] for component in components)
     if total_weight == 0:
-        return sigmoid(HOME_ADVANTAGE_LOGIT)
+        return sigmoid(model["intercept"])
     weighted_logit = (
         sum(component["weight"] * logit(component["prob"]) for component in components)
         / total_weight
     )
-    return sigmoid(weighted_logit + HOME_ADVANTAGE_LOGIT)
+    return sigmoid(model["scale"] * weighted_logit + model["intercept"])
 
 
 # ---------------------------------------------------------------------------
@@ -417,18 +556,23 @@ def parse_games(
     schedule: dict,
     standings_index: dict[int, dict] | None = None,
     pitcher_index: dict[int, dict] | None = None,
+    elo_ratings: dict[int, float] | None = None,
+    model: dict | None = None,
 ) -> list[dict]:
     """schedule 응답에서 경기별 승률 정보를 계산한다."""
     standings_index = standings_index or {}
     pitcher_index = pitcher_index or {}
+    model = model or DEFAULT_MODEL
     games = []
     for day in schedule.get("dates", []):
         for game in day.get("games", []):
             away = game["teams"]["away"]
             home = game["teams"]["home"]
 
-            components = compute_components(game, standings_index, pitcher_index)
-            home_win_prob = combine_components(components)
+            components = compute_components(
+                game, standings_index, pitcher_index, elo_ratings, model["weights"]
+            )
+            home_win_prob = combine_components(components, model)
 
             row = {
                 "away_team": away["team"]["name"],
@@ -487,6 +631,7 @@ COMPONENT_LABELS = {
     "split": "홈/원정",
     "form": "최근 10경기",
     "pitcher": "선발 투수",
+    "elo": "Elo",
 }
 
 
@@ -544,9 +689,28 @@ def main(argv: list[str] | None = None) -> int:
         "--detail", action="store_true", help="컴포넌트별 계산 근거도 출력"
     )
     parser.add_argument("--json", action="store_true", help="표 대신 JSON으로 출력")
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="backtest.py로 학습한 가중치 파일 경로"
+        " (지정하지 않아도 ./weights.json이 있으면 자동 사용)",
+    )
     args = parser.parse_args(argv)
 
     season = int(args.date[:4])
+
+    # 결합 모델: 학습된 가중치 파일이 있으면 사용, 없으면 기본값.
+    model = DEFAULT_MODEL
+    weights_path = args.weights or ("weights.json" if os.path.exists("weights.json") else None)
+    if weights_path:
+        try:
+            model = load_model(weights_path)
+            print(f"학습된 가중치 사용: {weights_path}", file=sys.stderr)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            print(
+                f"경고: 가중치 파일을 읽지 못해 기본 가중치를 사용합니다: {error}",
+                file=sys.stderr,
+            )
 
     try:
         schedule = fetch_schedule(args.date)
@@ -577,7 +741,18 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
-    games = parse_games(schedule, standings_index, pitcher_index)
+    # Elo: 전날까지의 시즌 결과를 재생해 레이팅을 계산한다.
+    elo_ratings: dict[int, float] = {}
+    try:
+        day_before = (date.fromisoformat(args.date) - timedelta(days=1)).isoformat()
+        elo_ratings = compute_elo_ratings(fetch_season_results(season, day_before))
+    except (urllib.error.URLError, TimeoutError, OSError, KeyError, ValueError) as error:
+        print(
+            f"경고: 시즌 결과 조회 실패 — Elo 컴포넌트를 건너뜁니다: {error}",
+            file=sys.stderr,
+        )
+
+    games = parse_games(schedule, standings_index, pitcher_index, elo_ratings, model)
 
     if args.json:
         print(

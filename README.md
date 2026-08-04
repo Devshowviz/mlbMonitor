@@ -7,7 +7,9 @@ MLB Stats API를 활용해 그날의 MLB 경기들의 승률(승리 확률)을 �
 ## 기능
 
 - 지정한 날짜(기본값: 오늘)의 MLB 경기 일정 조회
-- 5가지 컴포넌트 + 홈 어드밴티지를 결합한 앙상블 승리 확률 계산
+- 6가지 컴포넌트 + 홈 어드밴티지를 결합한 앙상블 승리 확률 계산
+- 시즌 경기 결과를 재생해 계산하는 팀별 **Elo 레이팅**
+- 과거 시즌으로 가중치를 **학습하는 백테스트** (`backtest.py`)
 - `--detail`로 컴포넌트별 계산 근거 확인
 - 이미 끝났거나 진행 중인 경기는 점수도 함께 표시
 - 일부 데이터 조회가 실패해도 가능한 컴포넌트만으로 계속 동작 (우아한 성능 저하)
@@ -30,6 +32,10 @@ python mlb_win_rate.py --detail
 
 # JSON으로 출력 (다른 프로그램에서 활용할 때)
 python mlb_win_rate.py --json
+
+# 과거 시즌으로 가중치 학습 → 이후 예측이 자동으로 학습된 가중치 사용
+python backtest.py --season 2025 --output weights.json
+python mlb_win_rate.py
 ```
 
 출력 예시 (`--detail`):
@@ -52,13 +58,17 @@ San Francisco Giants       60-50 | Los Angeles Dodgers        70-40 |     62.3% 
 각 컴포넌트가 독립적으로 "홈팀 승리 확률"을 내놓고, 이를 로그오즈(log-odds)
 공간에서 가중 평균한 뒤 홈 어드밴티지를 더해 최종 확률을 만듭니다.
 
-| 컴포넌트 | 가중치 | 데이터 출처 | 설명 |
+| 컴포넌트 | 기본 가중치 | 데이터 출처 | 설명 |
 |---|---|---|---|
-| 시즌 승률 log5 | 0.15 | schedule `leagueRecord` | Bill James의 log5 공식으로 두 팀 승률을 맞대결 확률로 변환 |
-| 피타고리안 log5 | 0.25 | standings 득점/실점 | 득실점 기반 기대 승률(Pythagenpat, 지수 = (경기당 총 득실점)^0.287). 실제 승률보다 팀 실력을 더 잘 반영한다고 알려짐 |
-| 홈/원정 스플릿 log5 | 0.15 | standings `splitRecords` | 홈팀의 **홈 성적** vs 원정팀의 **원정 성적** |
+| 시즌 승률 log5 | 0.10 | schedule `leagueRecord` | Bill James의 log5 공식으로 두 팀 승률을 맞대결 확률로 변환 |
+| 피타고리안 log5 | 0.20 | standings 득점/실점 | 득실점 기반 기대 승률(Pythagenpat, 지수 = (경기당 총 득실점)^0.287). 실제 승률보다 팀 실력을 더 잘 반영한다고 알려짐 |
+| 홈/원정 스플릿 log5 | 0.10 | standings `splitRecords` | 홈팀의 **홈 성적** vs 원정팀의 **원정 성적** |
 | 최근 10경기 log5 | 0.10 | standings `lastTen` | 최근 폼. 표본이 작아 강하게 보정하고 가중치도 낮게 |
-| 선발 투수 FIP | 0.35 | schedule `probablePitcher` + people 스탯 | 예고 선발의 FIP(수비 무관 평균자책 추정치) 차이를 로지스틱 함수로 확률화. 단일 경기에는 선발 매치업 영향이 커서 가중치 최대 |
+| 선발 투수 FIP | 0.30 | schedule `probablePitcher` + people 스탯 | 예고 선발의 FIP(수비 무관 평균자책 추정치) 차이를 로지스틱 함수로 확률화. 단일 경기에는 선발 매치업 영향이 커서 가중치 최대 |
+| Elo 레이팅 | 0.20 | 시즌 schedule 전체 결과 | 시즌 경기를 시간순으로 재생하며 팀별 Elo 계산 (FiveThirtyEight 방식 착안: K=4, 홈 어드밴티지 24점, 점수차 배수 반영). 상대 전적의 강도가 자연스럽게 반영됨 |
+
+기본 가중치는 수동 설정값이고, `backtest.py`로 학습한 `weights.json`이 있으면
+그 가중치(＋scale, intercept)로 대체됩니다.
 
 ### 세부 보정
 
@@ -83,19 +93,43 @@ San Francisco Giants       60-50 | Los Angeles Dodgers        70-40 |     62.3% 
 | `GET /api/v1/schedule?sportId=1&date=…&hydrate=probablePitcher` | 경기 목록, 팀 전적, 예고 선발 |
 | `GET /api/v1/standings?leagueId=103,104&season=…` | 득점/실점, 홈/원정 스플릿, 최근 10경기 |
 | `GET /api/v1/people?personIds=…&hydrate=stats(group=[pitching],type=[season])` | 선발 투수 시즌 스탯 (FIP 계산용) |
+| `GET /api/v1/schedule?sportId=1&startDate=…&endDate=…&gameType=R` | 시즌 전체 결과 (Elo 계산, 백테스트) |
+
+## 백테스트와 가중치 학습 (`backtest.py`)
+
+```bash
+python backtest.py --season 2025                        # 성능 평가만
+python backtest.py --season 2025 --output weights.json  # 가중치 학습 + 저장
+```
+
+동작 방식:
+
+1. 시즌 전체 경기 결과를 API 한 번으로 받아온다.
+2. 경기를 시간순으로 재생하면서, 각 경기마다 **그 경기 시작 전까지의 데이터만으로**
+   전적 기반 5개 컴포넌트(season, pythagorean, split, form, elo)의 확률을 계산한다.
+   상태 갱신은 반드시 계산 뒤에 하므로 미래 정보 누수(look-ahead bias)가 없다.
+3. 각 컴포넌트 확률의 로그오즈를 특징으로 하는 로지스틱 회귀를
+   경사하강법(표준 라이브러리만 사용)으로 학습한다. 절편이 홈 어드밴티지를 흡수한다.
+4. 시간순 뒤쪽 20% 홀드아웃으로 로그손실·브라이어 점수·적중률을 평가하고,
+   기본 가중치 앙상블·"항상 홈팀 54%" 베이스라인·컴포넌트 단독 성능과 비교한다.
+5. `--output`으로 저장한 `weights.json`은 `mlb_win_rate.py`가 자동으로 읽는다.
+
+참고: 선발 투수 컴포넌트는 "그 시점까지의 투수 스탯"을 과거로 거슬러 복원하기
+어려워(미래 누수 위험) 학습에서 제외하고, 저장 시 기본 가중치 몫(0.30)을 유지합니다.
+두 팀 모두 15경기 이상 치른 경기만 학습 샘플로 사용합니다(시즌 초반 노이즈 제거).
 
 ## 테스트
 
 ```bash
-python -m unittest test_mlb_win_rate -v
+python -m unittest test_mlb_win_rate test_backtest -v
 ```
 
-실제 API 응답 구조를 본뜬 샘플 데이터로 각 컴포넌트 계산식과
-앙상블 결합, 결측 처리를 검증합니다.
+실제 API 응답 구조를 본뜬 샘플 데이터와 합성 시즌 데이터로 각 컴포넌트 계산식,
+앙상블 결합, 결측 처리, Elo 갱신, 시즌 재생, 회귀 학습(알려진 모델 복원)을 검증합니다.
 
 ## 한계와 다음 단계
 
-- 시즌 승률 기반 지표들은 상대 전적의 강도(strength of schedule)를 반영하지 않음 → Elo 레이팅 추가 가능
 - 타선 세부 지표(wRC+, OPS), 불펜 상태, 부상자 명단 미반영
 - 구장 효과(파크 팩터), 날씨 미반영
-- 가중치는 통념 기반 수동 설정 → 과거 시즌 데이터로 백테스트해 로지스틱 회귀로 학습 가능
+- 선발 투수 가중치는 백테스트로 학습되지 않음 (시점별 투수 스탯 복원 필요)
+- Elo가 시즌마다 1500에서 리셋됨 → 전 시즌 레이팅을 축소 이월하면 시즌 초반 정확도 개선 가능
