@@ -165,11 +165,18 @@ def train_logistic(
     learning_rate: float = 0.3,
     epochs: int = 3000,
     l2: float = 0.001,
+    non_negative: bool = False,
 ) -> tuple[list[float], float]:
     """배치 경사하강법으로 로지스틱 회귀를 학습한다.
 
     모델: P(홈승) = sigmoid(intercept + Σ coef_i · feature_i)
     feature는 각 컴포넌트 확률의 로그오즈.
+
+    non_negative=True면 매 스텝 후 계수를 0 이상으로 투영한다(절편 제외).
+    컴포넌트들이 모두 같은 시즌 전적에서 파생돼 상관이 강한 탓에,
+    제약 없는 회귀는 음수 계수로 과적합하기 쉽다 — 앙상블 가중치의 의미
+    ("이 신호를 얼마나 믿을 것인가")에 맞게 음수를 금지한다.
+
     반환: (컴포넌트별 계수, 절편)
     """
     n_samples = len(features)
@@ -188,6 +195,8 @@ def train_logistic(
             grad_intercept += error
         for j in range(n_features):
             coefs[j] -= learning_rate * (grad_coefs[j] / n_samples + l2 * coefs[j])
+            if non_negative and coefs[j] < 0.0:
+                coefs[j] = 0.0
         intercept -= learning_rate * grad_intercept / n_samples
 
     return coefs, intercept
@@ -279,8 +288,12 @@ def build_weights_file(coefs: list[float], intercept: float, meta: dict) -> dict
 
 def run_backtest(
     samples: list[dict], holdout: float = 0.2
-) -> tuple[list[float], float, list[str]]:
-    """샘플을 시간순으로 나눠 학습/평가하고 (계수, 절편, 리포트)를 반환한다."""
+) -> tuple[list[float], float, list[str], dict]:
+    """샘플을 시간순으로 나눠 학습/평가하고 (계수, 절편, 리포트, 지표)를 반환한다.
+
+    컴포넌트들이 서로 강하게 상관되어 있어 제약 없는 회귀는 음수 계수로
+    과적합하기 쉬우므로, 비음수 제약 + 강한 L2 정규화로 학습한다.
+    """
     split_at = int(len(samples) * (1.0 - holdout))
     train, test = samples[:split_at], samples[split_at:]
 
@@ -288,15 +301,24 @@ def run_backtest(
         [logit(s["components"][name]) for name in FEATURE_NAMES] for s in train
     ]
     train_y = [s["home_won"] for s in train]
-    coefs, intercept = train_logistic(train_x, train_y)
+    coefs, intercept = train_logistic(
+        train_x, train_y, l2=0.01, non_negative=True
+    )
 
     test_y = [s["home_won"] for s in test]
+    learned_probs = [predict_learned(s, coefs, intercept) for s in test]
+    default_probs = [predict_default(s) for s in test]
+    metrics = {
+        "learned_logloss": log_loss(learned_probs, test_y),
+        "default_logloss": log_loss(default_probs, test_y),
+    }
+
     report = [
         f"학습 샘플 {len(train)}경기 / 평가 샘플 {len(test)}경기 (시간순 홀드아웃)",
         "",
         "--- 홀드아웃 평가 ---",
-        evaluate("학습된 앙상블", [predict_learned(s, coefs, intercept) for s in test], test_y),
-        evaluate("기본 가중치 앙상블", [predict_default(s) for s in test], test_y),
+        evaluate("학습된 앙상블", learned_probs, test_y),
+        evaluate("기본 가중치 앙상블", default_probs, test_y),
         evaluate("항상 홈팀 54%", [0.54] * len(test), test_y),
         "",
         "--- 컴포넌트 단독 성능 (홀드아웃) ---",
@@ -306,11 +328,11 @@ def run_backtest(
             evaluate(f"  {name}", [s["components"][name] for s in test], test_y)
         )
     report.append("")
-    report.append("--- 학습된 계수 (로그오즈 기준) ---")
+    report.append("--- 학습된 계수 (로그오즈 기준, 비음수 제약) ---")
     for name, coef in zip(FEATURE_NAMES, coefs):
         report.append(f"  {name:<12} {coef:+.4f}")
     report.append(f"  {'intercept':<12} {intercept:+.4f} (홈 어드밴티지)")
-    return coefs, intercept, report
+    return coefs, intercept, report, metrics
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -327,6 +349,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--output", default=None, help="학습된 가중치를 저장할 경로 (예: weights.json)"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="학습 모델이 홀드아웃에서 기본 가중치보다 나빠도 저장",
     )
     args = parser.parse_args(argv)
 
@@ -348,14 +375,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"학습 샘플이 너무 적습니다 ({len(samples)}건).", file=sys.stderr)
         return 1
 
-    coefs, intercept, report = run_backtest(samples, holdout=args.holdout)
+    coefs, intercept, report, metrics = run_backtest(samples, holdout=args.holdout)
     print("\n".join(report))
 
     if args.output:
+        # 홀드아웃에서 기본 가중치보다 나쁜 모델은 배포하지 않는다.
+        if metrics["learned_logloss"] > metrics["default_logloss"] and not args.force:
+            print(
+                "\n경고: 학습된 모델이 홀드아웃에서 기본 가중치보다 나빠서"
+                f" 저장하지 않습니다 (로그손실 {metrics['learned_logloss']:.4f}"
+                f" > {metrics['default_logloss']:.4f})."
+                " 그래도 저장하려면 --force를 사용하세요.",
+                file=sys.stderr,
+            )
+            return 1
         weights_data = build_weights_file(
             coefs,
             intercept,
-            {"season": args.season, "samples": len(samples), "end_date": end_date},
+            {
+                "season": args.season,
+                "samples": len(samples),
+                "end_date": end_date,
+                "holdout_logloss": round(metrics["learned_logloss"], 4),
+                "default_logloss": round(metrics["default_logloss"], 4),
+            },
         )
         with open(args.output, "w", encoding="utf-8") as file:
             json.dump(weights_data, file, ensure_ascii=False, indent=2)

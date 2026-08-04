@@ -145,6 +145,24 @@ class TrainLogisticTest(unittest.TestCase):
         self.assertAlmostEqual(coefs[1], -0.5, delta=0.25)
         self.assertAlmostEqual(intercept, 0.2, delta=0.15)
 
+    def test_non_negative_constraint_clamps_coefficients(self):
+        # 진짜 모델의 x2 계수가 음수여도, 제약 학습에서는 0 이상이어야 한다.
+        rng = random.Random(11)
+        features, labels = [], []
+        for _ in range(2000):
+            x1 = rng.uniform(-1, 1)
+            x2 = rng.uniform(-1, 1)
+            p = sigmoid(1.0 * x1 - 0.8 * x2)
+            features.append([x1, x2])
+            labels.append(1 if rng.random() < p else 0)
+        coefs, _ = train_logistic(
+            features, labels, epochs=1500, non_negative=True
+        )
+        self.assertGreaterEqual(coefs[0], 0.0)
+        self.assertGreaterEqual(coefs[1], 0.0)
+        self.assertEqual(coefs[1], 0.0)  # 음수 신호는 0으로 눌려야 한다
+        self.assertGreater(coefs[0], 0.5)  # 양수 신호는 살아 있어야 한다
+
 
 class MetricsTest(unittest.TestCase):
     def test_perfect_predictions(self):
@@ -160,7 +178,12 @@ class MetricsTest(unittest.TestCase):
 class EndToEndBacktestTest(unittest.TestCase):
     def test_learned_model_beats_baseline_on_holdout(self):
         samples = replay_season(make_synthetic_season(), min_games=15)
-        coefs, intercept, report = run_backtest(samples, holdout=0.2)
+        coefs, intercept, report, metrics = run_backtest(samples, holdout=0.2)
+
+        # 비음수 제약이 적용돼야 하고, 지표 딕셔너리가 채워져야 한다.
+        self.assertTrue(all(coef >= 0.0 for coef in coefs))
+        self.assertIn("learned_logloss", metrics)
+        self.assertIn("default_logloss", metrics)
 
         split_at = int(len(samples) * 0.8)
         test = samples[split_at:]
