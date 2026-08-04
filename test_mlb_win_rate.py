@@ -374,6 +374,49 @@ class MarketTest(unittest.TestCase):
         self.assertGreater(markets["expected_total"], 5.0)
 
 
+class MarketPickTest(unittest.TestCase):
+    def test_strong_favorite_picks_minus_line(self):
+        probs = market_probs(6.0, 3.0)  # 홈 압도적 우세
+        self.assertEqual(probs["runline_pick_team"], "home")
+        self.assertEqual(probs["runline_pick_line"], -1.5)
+        self.assertGreaterEqual(probs["runline_pick_prob"], 0.5)
+
+    def test_slight_favorite_picks_underdog_plus_line(self):
+        probs = market_probs(4.6, 4.4)  # 홈 근소 우세 → 커버 확률 < 0.5
+        self.assertEqual(probs["runline_pick_team"], "away")
+        self.assertEqual(probs["runline_pick_line"], 1.5)
+        self.assertGreaterEqual(probs["runline_pick_prob"], 0.5)
+
+    def test_away_favorite_pick(self):
+        probs = market_probs(3.0, 6.0)  # 원정 압도적 우세
+        self.assertEqual(probs["runline_pick_team"], "away")
+        self.assertEqual(probs["runline_pick_line"], -1.5)
+
+    def test_ou_pick_matches_over_prob(self):
+        low = market_probs(3.0, 3.0)
+        high = market_probs(6.0, 6.0)
+        self.assertEqual(low["ou_pick"], "under")
+        self.assertEqual(high["ou_pick"], "over")
+        self.assertGreaterEqual(low["ou_pick_prob"], 0.5)
+        self.assertGreaterEqual(high["ou_pick_prob"], 0.5)
+
+    def test_runline_pick_covered(self):
+        from mlb_win_rate import format_runline_pick, runline_pick_covered
+
+        home_minus = {"runline_pick_team": "home", "runline_pick_line": -1.5}
+        self.assertTrue(runline_pick_covered(home_minus, 2))
+        self.assertFalse(runline_pick_covered(home_minus, 1))
+        self.assertFalse(runline_pick_covered(home_minus, -3))
+
+        away_plus = {"runline_pick_team": "away", "runline_pick_line": 1.5}
+        self.assertTrue(runline_pick_covered(away_plus, 1))   # 홈 1점차 승 → +1.5 커버
+        self.assertTrue(runline_pick_covered(away_plus, -4))  # 원정 승
+        self.assertFalse(runline_pick_covered(away_plus, 2))
+
+        self.assertEqual(format_runline_pick(home_minus), "홈 -1.5")
+        self.assertEqual(format_runline_pick(away_plus), "원정 +1.5")
+
+
 # ---------------------------------------------------------------------------
 # Elo
 # ---------------------------------------------------------------------------
@@ -733,19 +776,35 @@ class FormatTableTest(unittest.TestCase):
         self.assertIn("Los Angeles Dodgers", output)
         self.assertIn("San Francisco Giants", output)
         self.assertIn("2경기", output)
-        self.assertIn("(3:5)", output)
-        self.assertIn("Ace Home", output)
+        self.assertIn("종료 3:5", output)
+        self.assertIn("핸디캡 예상", output)
+        self.assertIn("언더오버 예상", output)
 
-    def test_detail_mode_shows_components(self):
+    def test_table_shows_picks(self):
+        output = format_table(self.games, "2026-08-03")
+        # game1: 홈 커버 확률 > 0.5 → 홈 -1.5 픽, 오버 확률 < 0.5 → 언더 픽
+        self.assertIn("홈 -1.5", output)
+        self.assertIn("언더 8.5", output)
+
+    def test_detail_mode_shows_components_and_pitchers(self):
         output = format_table(self.games, "2026-08-03", detail=True)
         self.assertIn("피타고리안", output)
         self.assertIn("선발 투수", output)
         self.assertIn("가중치", output)
+        self.assertIn("Ace Home", output)
 
     def test_finished_game_marked_hit_or_miss(self):
-        # 다저스 홈승(5:3) 예측이 홈승이므로 '적중' 표시가 나와야 한다.
+        # 다저스 홈승(5:3) 예측이 홈승이므로 적중 마크가 나와야 한다.
         output = format_table(self.games, "2026-08-03")
-        self.assertIn("→ 적중", output)
+        self.assertIn("✓", output)
+
+    def test_columns_aligned_by_display_width(self):
+        from mlb_win_rate import display_width
+
+        output = format_table(self.games, "2026-08-03")
+        lines = output.splitlines()
+        header, separator = lines[1], lines[2]
+        self.assertEqual(display_width(header), display_width(separator))
 
 
 class EvaluationStatsTest(unittest.TestCase):
@@ -781,7 +840,8 @@ class EvaluationStatsTest(unittest.TestCase):
     def test_format_evaluation_output(self):
         text = format_evaluation(evaluation_stats(self.games))
         self.assertIn("예측 검증", text)
-        self.assertIn("적중 1/1", text)
+        self.assertIn("1/1", text)
+        self.assertIn("100.0%", text)
 
     def test_markets_evaluated_when_present(self):
         stats = evaluation_stats(self.games)
@@ -805,8 +865,8 @@ class EvaluationStatsTest(unittest.TestCase):
         self.assertEqual(over_under["avg_actual_total"], 8.0)
         self.assertGreater(over_under["avg_expected_total"], 5.0)
         text = format_evaluation(stats)
-        self.assertIn("평균 예측 홈승", text)
-        self.assertIn("실제 평균 합계", text)
+        self.assertIn("캘리브레이션", text)
+        self.assertIn("합계", text)
 
 
 class SeasonFromStandingsTest(unittest.TestCase):

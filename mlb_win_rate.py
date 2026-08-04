@@ -32,6 +32,7 @@ import json
 import math
 import os
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -379,7 +380,7 @@ def market_probs(
     home_share = p_home_win / decided if decided > 0 else 0.5
     home_ml = p_home_win + p_tie * home_share
 
-    return {
+    markets = {
         "expected_home_runs": round(mu_home, 2),
         "expected_away_runs": round(mu_away, 2),
         "expected_total": round(mu_home + mu_away, 2),
@@ -393,6 +394,45 @@ def market_probs(
         "over_prob": round(p_over, 3),
         "under_prob": round(1.0 - p_over, 3),
     }
+
+    # 핸디캡 픽: 우세팀(-run_line) vs 열세팀(+run_line) 중 확률 높은 쪽.
+    favorite = "home" if home_ml >= 0.5 else "away"
+    favorite_cover = p_home_cover if favorite == "home" else p_away_cover
+    if favorite_cover >= 0.5:
+        markets["runline_pick_team"] = favorite
+        markets["runline_pick_line"] = -run_line
+        markets["runline_pick_prob"] = round(favorite_cover, 3)
+    else:
+        markets["runline_pick_team"] = "away" if favorite == "home" else "home"
+        markets["runline_pick_line"] = run_line
+        markets["runline_pick_prob"] = round(1.0 - favorite_cover, 3)
+
+    # 언더오버 픽
+    if p_over >= 0.5:
+        markets["ou_pick"] = "over"
+        markets["ou_pick_prob"] = round(p_over, 3)
+    else:
+        markets["ou_pick"] = "under"
+        markets["ou_pick_prob"] = round(1.0 - p_over, 3)
+
+    return markets
+
+
+def runline_pick_covered(markets: dict, home_margin: int) -> bool:
+    """핸디캡 픽이 실제 점수차로 커버됐는지 판정한다.
+
+    픽 팀 기준 점수차 + 핸디캡 라인이 0보다 크면 커버.
+    (예: 홈 -1.5 픽 → 홈 점수차 2 이상, 원정 +1.5 픽 → 홈 점수차 1 이하)
+    """
+    team_margin = home_margin if markets["runline_pick_team"] == "home" else -home_margin
+    return team_margin + markets["runline_pick_line"] > 0
+
+
+def format_runline_pick(markets: dict) -> str:
+    """핸디캡 픽을 '홈 -1.5' 같은 문자열로 만든다."""
+    team = "홈" if markets["runline_pick_team"] == "home" else "원정"
+    line = markets["runline_pick_line"]
+    return f"{team} {line:+.1f}"
 
 
 def compute_markets(
@@ -826,55 +866,137 @@ COMPONENT_LABELS = {
     "elo": "Elo",
 }
 
+STATUS_LABELS = {
+    "Final": "종료",
+    "Completed Early": "종료",
+    "Game Over": "종료",
+    "Scheduled": "예정",
+    "Pre-Game": "예정",
+    "Warmup": "예정",
+    "In Progress": "진행중",
+    "Postponed": "연기",
+    "Suspended": "중단",
+    "Cancelled": "취소",
+    "Delayed": "지연",
+}
+
+
+def display_width(text: str) -> int:
+    """터미널 표시 폭. 한글 등 전각 문자는 2칸으로 계산한다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad(text: str, width: int, align: str = "left") -> str:
+    """표시 폭 기준으로 공백을 채워 정렬한다 (한글 섞인 표 정렬용)."""
+    gap = max(width - display_width(text), 0)
+    if align == "right":
+        return " " * gap + text
+    return text + " " * gap
+
+
+def _render_table(headers: list[str], rows: list[list[str]], aligns: list[str]) -> list[str]:
+    """헤더와 행들을 표시 폭 기준으로 정렬한 표 문자열 목록으로 만든다."""
+    widths = [
+        max(display_width(headers[i]), *(display_width(row[i]) for row in rows))
+        if rows else display_width(headers[i])
+        for i in range(len(headers))
+    ]
+    lines = [
+        "  ".join(pad(header, width) for header, width in zip(headers, widths)),
+        "  ".join("─" * width for width in widths),
+    ]
+    for row in rows:
+        lines.append(
+            "  ".join(
+                pad(cell, width, align)
+                for cell, width, align in zip(row, widths, aligns)
+            )
+        )
+    return lines
+
+
+def _hit_mark(hit: bool) -> str:
+    return "✓" if hit else "✗"
+
 
 def format_table(games: list[dict], game_date: str, detail: bool = False) -> str:
     """경기 목록을 읽기 좋은 표 형태의 문자열로 만든다."""
     if not games:
         return f"{game_date}에는 예정된 MLB 경기가 없습니다."
 
-    lines = [f"=== {game_date} MLB 경기 승률 예측 ({len(games)}경기) ==="]
-    header = (
-        f"{'원정팀':<24} {'전적':>7} | {'홈팀':<24} {'전적':>7} | "
-        f"{'홈승확률':>8} {'원정승확률':>8}  상태"
-    )
-    lines.append(header)
-    lines.append("-" * 100)
-
+    headers = ["원정팀 (전적)", "홈팀 (전적)", "홈승", "핸디캡 예상", "언더오버 예상", "상태"]
+    aligns = ["left", "left", "right", "left", "left", "left"]
+    rows = []
     for game in games:
-        score = ""
-        if "away_score" in game:
-            score = f" ({game['away_score']}:{game['home_score']})"
-            if game["away_score"] != game["home_score"]:
-                predicted_home = game["home_win_prob"] >= 0.5
-                actual_home = game["home_score"] > game["away_score"]
-                score += " → 적중" if predicted_home == actual_home else " → 빗나감"
-        lines.append(
-            f"{game['away_team']:<24} {game['away_record']:>7} | "
-            f"{game['home_team']:<24} {game['home_record']:>7} | "
-            f"{game['home_win_prob']:>9.1%} {game['away_win_prob']:>10.1%}  "
-            f"{game['status']}{score}"
+        finished = (
+            "away_score" in game and game["away_score"] != game["home_score"]
         )
-        if game["away_pitcher"] or game["home_pitcher"]:
-            lines.append(
-                f"    선발: {game['away_pitcher'] or '미정'}"
-                f" vs {game['home_pitcher'] or '미정'}"
-            )
+        margin = total = None
+        if finished:
+            margin = game["home_score"] - game["away_score"]
+            total = game["home_score"] + game["away_score"]
+
+        win_cell = f"{game['home_win_prob']:.1%}"
+        if finished:
+            win_cell += _hit_mark((game["home_win_prob"] >= 0.5) == (margin > 0))
+
         markets = game.get("markets")
         if markets:
-            lines.append(
-                f"    마켓: 예상 득점 {markets['expected_away_runs']:.1f}:"
-                f"{markets['expected_home_runs']:.1f}"
-                f" (합 {markets['expected_total']:.1f})"
-                f" | 오버 {markets['total_line']}: {markets['over_prob']:.1%}"
-                f" / 언더: {markets['under_prob']:.1%}"
-                f" | 핸디캡 홈 -{markets['run_line']}: {markets['home_runline_prob']:.1%}"
-                f" / 원정 -{markets['run_line']}: {markets['away_runline_prob']:.1%}"
+            runline_cell = (
+                f"{format_runline_pick(markets)} ({markets['runline_pick_prob']:.0%})"
             )
-        if detail:
+            if finished:
+                runline_cell += _hit_mark(runline_pick_covered(markets, margin))
+            ou_label = "오버" if markets["ou_pick"] == "over" else "언더"
+            ou_cell = f"{ou_label} {markets['total_line']} ({markets['ou_pick_prob']:.0%})"
+            if finished and total != markets["total_line"]:
+                ou_cell += _hit_mark(
+                    (total > markets["total_line"]) == (markets["ou_pick"] == "over")
+                )
+        else:
+            runline_cell = ou_cell = "-"
+
+        status = STATUS_LABELS.get(game["status"], game["status"])
+        if "away_score" in game:
+            status += f" {game['away_score']}:{game['home_score']}"
+
+        rows.append(
+            [
+                f"{game['away_team']} ({game['away_record']})",
+                f"{game['home_team']} ({game['home_record']})",
+                win_cell,
+                runline_cell,
+                ou_cell,
+                status,
+            ]
+        )
+
+    lines = [f"=== {game_date} MLB 경기 승률 예측 ({len(games)}경기) ==="]
+    lines.extend(_render_table(headers, rows, aligns))
+
+    if detail:
+        lines.append("")
+        for game in games:
+            lines.append(f"[{game['away_team']} @ {game['home_team']}]")
+            if game["away_pitcher"] or game["home_pitcher"]:
+                lines.append(
+                    f"  선발: {game['away_pitcher'] or '미정'}"
+                    f" vs {game['home_pitcher'] or '미정'}"
+                )
+            markets = game.get("markets")
+            if markets:
+                lines.append(
+                    f"  마켓: 예상 득점 {markets['expected_away_runs']:.1f}:"
+                    f"{markets['expected_home_runs']:.1f}"
+                    f" (합 {markets['expected_total']:.1f})"
+                    f" | 오버 {markets['total_line']}: {markets['over_prob']:.1%}"
+                    f" | 홈 -{markets['run_line']}: {markets['home_runline_prob']:.1%}"
+                    f" / 원정 -{markets['run_line']}: {markets['away_runline_prob']:.1%}"
+                )
             for component in game["components"]:
                 label = COMPONENT_LABELS.get(component["name"], component["name"])
                 lines.append(
-                    f"    [{label:<7}] 홈승 {component['home_prob']:.3f}"
+                    f"  [{pad(label, 12)}] 홈승 {component['home_prob']:.3f}"
                     f" (가중치 {component['weight']:.2f}) — {component['detail']}"
                 )
             lines.append("")
@@ -937,7 +1059,8 @@ def evaluation_stats(games: list[dict]) -> dict | None:
         runline_covers += actual_cover
         runline_pred_sum += markets["home_runline_prob"]
         runline_brier += (markets["home_runline_prob"] - actual_cover) ** 2
-        if (markets["home_runline_prob"] >= 0.5) == (actual_cover == 1):
+        # 적중률은 표에 표시되는 실제 픽(우세팀 라인 기준) 기준으로 계산한다.
+        if runline_pick_covered(markets, margin):
             runline_hits += 1
         runline_count += 1
 
@@ -955,6 +1078,7 @@ def evaluation_stats(games: list[dict]) -> dict | None:
     if runline_count:
         stats["runline"] = {
             "games": runline_count,
+            "hits": runline_hits,
             "accuracy": round(runline_hits / runline_count, 3),
             "brier": round(runline_brier / runline_count, 4),
             "avg_pred_cover": round(runline_pred_sum / runline_count, 3),
@@ -963,6 +1087,7 @@ def evaluation_stats(games: list[dict]) -> dict | None:
     if over_count:
         stats["over_under"] = {
             "games": over_count,
+            "hits": over_hits,
             "accuracy": round(over_hits / over_count, 3),
             "brier": round(over_brier / over_count, 4),
             "avg_pred_over": round(over_pred_sum / over_count, 3),
@@ -974,37 +1099,48 @@ def evaluation_stats(games: list[dict]) -> dict | None:
 
 
 def format_evaluation(stats: dict) -> str:
-    lines = [
-        f"=== 예측 검증 (끝난 경기 {stats['games']}건) ===",
-        f"승패     적중 {stats['hits']}/{stats['games']} ({stats['accuracy']:.1%})"
-        f"  로그손실 {stats['log_loss']:.4f}  브라이어 {stats['brier']:.4f}",
-        f"         평균 예측 홈승 {stats['avg_pred_home']:.1%}"
-        f" vs 실제 홈승률 {stats['actual_home_rate']:.1%}",
+    headers = ["구분", "적중", "적중률", "브라이어", "캘리브레이션 (예측 vs 실제)"]
+    aligns = ["left", "right", "right", "right", "left"]
+    rows = [
+        [
+            "승패",
+            f"{stats['hits']}/{stats['games']}",
+            f"{stats['accuracy']:.1%}",
+            f"{stats['brier']:.4f}",
+            f"홈승 {stats['avg_pred_home']:.1%} vs {stats['actual_home_rate']:.1%}",
+        ]
     ]
     if "runline" in stats:
         runline = stats["runline"]
-        lines.append(
-            f"핸디캡   적중률 {runline['accuracy']:.1%}"
-            f"  브라이어 {runline['brier']:.4f} ({runline['games']}건, 홈 -1.5 기준)"
-        )
-        lines.append(
-            f"         평균 예측 커버 {runline['avg_pred_cover']:.1%}"
-            f" vs 실제 커버율 {runline['actual_cover_rate']:.1%}"
+        rows.append(
+            [
+                "핸디캡",
+                f"{runline['hits']}/{runline['games']}",
+                f"{runline['accuracy']:.1%}",
+                f"{runline['brier']:.4f}",
+                f"홈커버 {runline['avg_pred_cover']:.1%}"
+                f" vs {runline['actual_cover_rate']:.1%}",
+            ]
         )
     if "over_under" in stats:
         over_under = stats["over_under"]
-        lines.append(
-            f"언더오버 적중률 {over_under['accuracy']:.1%}"
-            f"  브라이어 {over_under['brier']:.4f} ({over_under['games']}건)"
+        rows.append(
+            [
+                "언더오버",
+                f"{over_under['hits']}/{over_under['games']}",
+                f"{over_under['accuracy']:.1%}",
+                f"{over_under['brier']:.4f}",
+                f"오버 {over_under['avg_pred_over']:.1%}"
+                f" vs {over_under['actual_over_rate']:.1%}"
+                f" · 합계 {over_under['avg_expected_total']:.2f}"
+                f" vs {over_under['avg_actual_total']:.2f}",
+            ]
         )
-        lines.append(
-            f"         평균 예측 오버 {over_under['avg_pred_over']:.1%}"
-            f" vs 실제 오버율 {over_under['actual_over_rate']:.1%}"
-            f" | 예상 평균 합계 {over_under['avg_expected_total']:.2f}"
-            f" vs 실제 평균 합계 {over_under['avg_actual_total']:.2f}"
-        )
+    lines = [f"=== 예측 검증 (끝난 경기 {stats['games']}건) ==="]
+    lines.extend(_render_table(headers, rows, aligns))
     lines.append(
-        "(참고: 동전던지기 로그손실 0.6931, 전적 기반 모델의 현실적 수준 ≈ 0.68)"
+        f"승패 로그손실 {stats['log_loss']:.4f}"
+        " (동전던지기 0.6931, 전적 기반 모델의 현실적 수준 ≈ 0.68)"
     )
     return "\n".join(lines)
 
