@@ -139,9 +139,18 @@ San Francisco Giants       60-50 | Los Angeles Dodgers        70-40 |     62.3% 
 ## 백테스트와 가중치 학습 (`backtest.py`)
 
 ```bash
-python backtest.py --season 2025                        # 성능 평가만
-python backtest.py --season 2025 --output weights.json  # 가중치 학습 + 저장
+python backtest.py --season 2025                            # 성능 평가만
+python backtest.py --season 2025 --output weights.json      # 가중치 학습 + 저장
+python backtest.py --seasons 2021-2025 --output weights.json  # 여러 시즌 학습
 ```
+
+여러 시즌을 학습할 때는 시즌마다 팀 상태와 Elo를 리셋해 시즌 간 누수를 막습니다.
+2020 시즌은 60경기 단축 시즌(무관중, 7이닝 더블헤더)이라 데이터가 왜곡되어 있어
+학습에 넣지 않는 것을 권장합니다 (넣으면 경고가 출력됩니다).
+
+백테스트는 세 가지 후보를 홀드아웃에서 비교해 이긴 것만 저장합니다:
+① 학습된 컴포넌트 가중치, ② 기본 가중치 + 2-파라미터(scale/intercept) 보정,
+③ 순수 기본 가중치. ③이 최고면 저장을 거부합니다 — weights.json 없이 쓰는 게 최선.
 
 동작 방식:
 

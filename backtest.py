@@ -15,6 +15,11 @@
 사용 예:
     python backtest.py --season 2025
     python backtest.py --season 2025 --output weights.json
+    python backtest.py --seasons 2021-2025 --output weights.json
+
+여러 시즌을 학습할 때는 시즌마다 팀 상태와 Elo를 리셋해 시즌 간 누수를
+막는다. 2020 시즌은 60경기 단축 시즌(무관중, 7이닝 더블헤더)이라 데이터가
+왜곡되어 있으므로 학습에 넣지 않는 것을 권장한다.
 """
 
 from __future__ import annotations
@@ -45,6 +50,21 @@ from mlb_win_rate import (
 
 # 학습 대상 컴포넌트 (전적 기반 — 경기 결과만으로 시점 복원이 가능한 것들)
 FEATURE_NAMES = ["season", "pythagorean", "split", "form", "elo"]
+
+
+def parse_seasons(text: str) -> list[int]:
+    """'2025', '2021-2025', '2021,2023' 형식을 시즌 목록으로 바꾼다."""
+    seasons: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            seasons.extend(range(int(start), int(end) + 1))
+        elif part:
+            seasons.append(int(part))
+    if not seasons:
+        raise ValueError(f"시즌을 해석할 수 없습니다: {text!r}")
+    return sorted(set(seasons))
 
 # 학습에서 제외되는 선발 투수 컴포넌트가 weights.json에서 가져갈 몫
 PITCHER_WEIGHT_SHARE = WEIGHTS["pitcher"]
@@ -372,9 +392,17 @@ def run_backtest(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MLB 승률 앙상블 가중치 백테스트")
-    parser.add_argument("--season", type=int, required=True, help="백테스트할 시즌 (예: 2025)")
+    parser.add_argument("--season", type=int, default=None, help="백테스트할 시즌 (예: 2025)")
     parser.add_argument(
-        "--end-date", default=None, help="이 날짜까지의 경기만 사용 (기본: 시즌 전체)"
+        "--seasons",
+        default=None,
+        help="여러 시즌 학습 (예: 2021-2025 또는 2021,2023,2025)."
+        " 2020은 단축 시즌이라 제외를 권장. --season과 둘 중 하나만 지정.",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="마지막 시즌에서 이 날짜까지의 경기만 사용 (기본: 시즌 전체)",
     )
     parser.add_argument(
         "--min-games", type=int, default=15, help="샘플로 쓰기 위한 팀당 최소 경기 수"
@@ -392,20 +420,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    end_date = args.end_date or f"{args.season}-12-01"
-    print(f"{args.season} 시즌 결과를 가져오는 중...", file=sys.stderr)
+    if bool(args.season) == bool(args.seasons):
+        print("--season 또는 --seasons 중 하나만 지정하세요.", file=sys.stderr)
+        return 1
     try:
-        results = fetch_season_results(args.season, end_date)
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"MLB Stats API 호출에 실패했습니다: {error}", file=sys.stderr)
+        seasons = parse_seasons(args.seasons) if args.seasons else [args.season]
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
         return 1
+    if 2020 in seasons:
+        print(
+            "참고: 2020은 60경기 단축 시즌(무관중)이라 데이터가 왜곡되어"
+            " 있습니다 — 제외를 권장합니다.",
+            file=sys.stderr,
+        )
 
-    if not results:
-        print("해당 기간에 끝난 경기가 없습니다.", file=sys.stderr)
-        return 1
+    # 시즌별로 독립 재생 (팀 상태·Elo는 시즌마다 리셋 → 시즌 간 누수 없음)
+    samples: list[dict] = []
+    last_season = seasons[-1]
+    for season in seasons:
+        end_date = (
+            args.end_date if args.end_date and season == last_season
+            else f"{season}-12-01"
+        )
+        print(f"{season} 시즌 결과를 가져오는 중...", file=sys.stderr)
+        try:
+            results = fetch_season_results(season, end_date)
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            print(f"MLB Stats API 호출에 실패했습니다: {error}", file=sys.stderr)
+            return 1
+        season_samples = replay_season(results, min_games=args.min_games)
+        print(
+            f"  완료된 경기 {len(results)}건 → 학습 샘플 {len(season_samples)}건",
+            file=sys.stderr,
+        )
+        samples.extend(season_samples)
 
-    print(f"완료된 경기 {len(results)}건, 시즌 재생 중...", file=sys.stderr)
-    samples = replay_season(results, min_games=args.min_games)
     if len(samples) < 100:
         print(f"학습 샘플이 너무 적습니다 ({len(samples)}건).", file=sys.stderr)
         return 1
@@ -416,9 +466,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         # 후보 중 홀드아웃 로그손실이 가장 낮은 모델을 고른다.
         meta = {
-            "season": args.season,
+            "season": seasons[0] if len(seasons) == 1 else None,
+            "seasons": seasons,
             "samples": len(samples),
-            "end_date": end_date,
             "default_logloss": round(metrics["default_logloss"], 4),
         }
         calibration = metrics["calibration"]

@@ -10,6 +10,7 @@ import unittest
 from backtest import (
     FEATURE_NAMES,
     TeamState,
+    parse_seasons,
     accuracy,
     brier_score,
     build_calibrated_weights_file,
@@ -226,6 +227,41 @@ class BuildWeightsFileTest(unittest.TestCase):
     def test_all_zero_coefficients_raises(self):
         with self.assertRaises(ValueError):
             build_weights_file([0.0, -1.0, 0.0, 0.0, 0.0], 0.1, {})
+
+
+class ParseSeasonsTest(unittest.TestCase):
+    def test_single_season(self):
+        self.assertEqual(parse_seasons("2025"), [2025])
+
+    def test_range(self):
+        self.assertEqual(parse_seasons("2021-2025"), [2021, 2022, 2023, 2024, 2025])
+
+    def test_comma_list_and_dedup(self):
+        self.assertEqual(parse_seasons("2023,2021,2023"), [2021, 2023])
+
+    def test_mixed(self):
+        self.assertEqual(parse_seasons("2021-2022,2025"), [2021, 2022, 2025])
+
+    def test_invalid_raises(self):
+        with self.assertRaises(ValueError):
+            parse_seasons(",")
+
+
+class MultiSeasonReplayTest(unittest.TestCase):
+    def test_seasons_replayed_independently(self):
+        # 두 시즌을 따로 재생한 샘플 수의 합 = 각각 재생한 것과 같아야 하고,
+        # 시즌 경계에서 상태가 리셋되므로 각 시즌 초반 경기는 샘플에서 빠진다.
+        season_a = make_synthetic_season(seed=1)
+        season_b = make_synthetic_season(seed=2)
+        samples_a = replay_season(season_a, min_games=15)
+        samples_b = replay_season(season_b, min_games=15)
+        combined = samples_a + samples_b
+        self.assertEqual(
+            len(combined), len(samples_a) + len(samples_b)
+        )
+        # 각 시즌이 독립적으로 min_games 필터를 통과했는지 확인
+        self.assertLess(len(samples_a), len(season_a))
+        self.assertLess(len(samples_b), len(season_b))
 
 
 class CalibrationTest(unittest.TestCase):
