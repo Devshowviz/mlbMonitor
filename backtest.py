@@ -242,14 +242,23 @@ def predict_learned(sample: dict, coefs: list[float], intercept: float) -> float
     return sigmoid(z)
 
 
-def predict_default(sample: dict) -> float:
-    """mlb_win_rate 기본 가중치(전적 기반 컴포넌트만)로 예측."""
+def default_ensemble_logit(sample: dict) -> float:
+    """기본 가중치로 만든 앙상블의 로그오즈 (홈 어드밴티지 제외)."""
     total = sum(WEIGHTS[name] for name in FEATURE_NAMES)
-    weighted = (
+    return (
         sum(WEIGHTS[name] * logit(sample["components"][name]) for name in FEATURE_NAMES)
         / total
     )
-    return sigmoid(weighted + HOME_ADVANTAGE_LOGIT)
+
+
+def predict_default(sample: dict) -> float:
+    """mlb_win_rate 기본 가중치(전적 기반 컴포넌트만)로 예측."""
+    return sigmoid(default_ensemble_logit(sample) + HOME_ADVANTAGE_LOGIT)
+
+
+def predict_calibrated(sample: dict, scale: float, intercept: float) -> float:
+    """기본 앙상블의 기울기·절편만 보정한 예측."""
+    return sigmoid(scale * default_ensemble_logit(sample) + intercept)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +291,16 @@ def build_weights_file(coefs: list[float], intercept: float, meta: dict) -> dict
     }
 
 
+def build_calibrated_weights_file(scale: float, intercept: float, meta: dict) -> dict:
+    """기본 가중치를 유지하고 scale/intercept만 보정한 weights.json을 만든다."""
+    return {
+        "weights": dict(WEIGHTS),
+        "scale": round(scale, 4),
+        "intercept": round(intercept, 4),
+        "trained": meta,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
@@ -305,12 +324,24 @@ def run_backtest(
         train_x, train_y, l2=0.01, non_negative=True
     )
 
+    # 대안 후보: 기본 가중치는 그대로 두고 기울기(scale)·절편만 2-파라미터로 보정.
+    # 파라미터가 2개뿐이라 과적합 위험이 작고, 컴포넌트 간 상관 문제를 피한다.
+    cal_x = [[default_ensemble_logit(s)] for s in train]
+    (cal_scale,), cal_intercept = train_logistic(
+        cal_x, train_y, l2=0.0, non_negative=True
+    )
+
     test_y = [s["home_won"] for s in test]
     learned_probs = [predict_learned(s, coefs, intercept) for s in test]
     default_probs = [predict_default(s) for s in test]
+    calibrated_probs = [
+        predict_calibrated(s, cal_scale, cal_intercept) for s in test
+    ]
     metrics = {
         "learned_logloss": log_loss(learned_probs, test_y),
         "default_logloss": log_loss(default_probs, test_y),
+        "calibrated_logloss": log_loss(calibrated_probs, test_y),
+        "calibration": {"scale": cal_scale, "intercept": cal_intercept},
     }
 
     report = [
@@ -318,6 +349,7 @@ def run_backtest(
         "",
         "--- 홀드아웃 평가 ---",
         evaluate("학습된 앙상블", learned_probs, test_y),
+        evaluate("보정된 기본 앙상블", calibrated_probs, test_y),
         evaluate("기본 가중치 앙상블", default_probs, test_y),
         evaluate("항상 홈팀 54%", [0.54] * len(test), test_y),
         "",
@@ -332,6 +364,9 @@ def run_backtest(
     for name, coef in zip(FEATURE_NAMES, coefs):
         report.append(f"  {name:<12} {coef:+.4f}")
     report.append(f"  {'intercept':<12} {intercept:+.4f} (홈 어드밴티지)")
+    report.append(
+        f"  보정 파라미터: scale {cal_scale:+.4f}, intercept {cal_intercept:+.4f}"
+    )
     return coefs, intercept, report, metrics
 
 
@@ -379,30 +414,56 @@ def main(argv: list[str] | None = None) -> int:
     print("\n".join(report))
 
     if args.output:
+        # 후보 중 홀드아웃 로그손실이 가장 낮은 모델을 고른다.
+        meta = {
+            "season": args.season,
+            "samples": len(samples),
+            "end_date": end_date,
+            "default_logloss": round(metrics["default_logloss"], 4),
+        }
+        calibration = metrics["calibration"]
+        candidates = [
+            (
+                "learned",
+                metrics["learned_logloss"],
+                lambda: build_weights_file(
+                    coefs,
+                    intercept,
+                    dict(meta, variant="learned",
+                         holdout_logloss=round(metrics["learned_logloss"], 4)),
+                ),
+            ),
+            (
+                "calibrated",
+                metrics["calibrated_logloss"],
+                lambda: build_calibrated_weights_file(
+                    calibration["scale"],
+                    calibration["intercept"],
+                    dict(meta, variant="calibrated",
+                         holdout_logloss=round(metrics["calibrated_logloss"], 4)),
+                ),
+            ),
+        ]
+        best_name, best_logloss, best_builder = min(
+            candidates, key=lambda candidate: candidate[1]
+        )
+
         # 홀드아웃에서 기본 가중치보다 나쁜 모델은 배포하지 않는다.
-        if metrics["learned_logloss"] > metrics["default_logloss"] and not args.force:
+        if best_logloss > metrics["default_logloss"] and not args.force:
             print(
-                "\n경고: 학습된 모델이 홀드아웃에서 기본 가중치보다 나빠서"
-                f" 저장하지 않습니다 (로그손실 {metrics['learned_logloss']:.4f}"
-                f" > {metrics['default_logloss']:.4f})."
+                "\n경고: 어떤 학습 모델도 홀드아웃에서 기본 가중치보다 낫지 않아"
+                f" 저장하지 않습니다 (최선 {best_name} {best_logloss:.4f}"
+                f" > 기본 {metrics['default_logloss']:.4f})."
+                " weights.json 없이 기본 가중치를 쓰는 것이 최선입니다."
                 " 그래도 저장하려면 --force를 사용하세요.",
                 file=sys.stderr,
             )
             return 1
-        weights_data = build_weights_file(
-            coefs,
-            intercept,
-            {
-                "season": args.season,
-                "samples": len(samples),
-                "end_date": end_date,
-                "holdout_logloss": round(metrics["learned_logloss"], 4),
-                "default_logloss": round(metrics["default_logloss"], 4),
-            },
-        )
         with open(args.output, "w", encoding="utf-8") as file:
-            json.dump(weights_data, file, ensure_ascii=False, indent=2)
-        print(f"\n가중치를 저장했습니다: {args.output}")
+            json.dump(best_builder(), file, ensure_ascii=False, indent=2)
+        variant_label = "학습 가중치" if best_name == "learned" else "보정된 기본 가중치"
+        print(f"\n{variant_label} 모델을 저장했습니다: {args.output}"
+              f" (홀드아웃 로그손실 {best_logloss:.4f})")
         print("이제 `python mlb_win_rate.py`가 이 가중치를 자동으로 사용합니다.")
     return 0
 

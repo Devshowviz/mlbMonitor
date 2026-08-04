@@ -12,15 +12,19 @@ from backtest import (
     TeamState,
     accuracy,
     brier_score,
+    build_calibrated_weights_file,
     build_weights_file,
+    default_ensemble_logit,
     game_components,
     log_loss,
+    predict_calibrated,
     predict_default,
     predict_learned,
     replay_season,
     run_backtest,
     train_logistic,
 )
+from mlb_win_rate import WEIGHTS
 from mlb_win_rate import ELO_INITIAL, logit, sigmoid
 
 
@@ -184,6 +188,9 @@ class EndToEndBacktestTest(unittest.TestCase):
         self.assertTrue(all(coef >= 0.0 for coef in coefs))
         self.assertIn("learned_logloss", metrics)
         self.assertIn("default_logloss", metrics)
+        self.assertIn("calibrated_logloss", metrics)
+        self.assertGreaterEqual(metrics["calibration"]["scale"], 0.0)
+        self.assertIn("보정된 기본 앙상블", "\n".join(report))
 
         split_at = int(len(samples) * 0.8)
         test = samples[split_at:]
@@ -219,6 +226,38 @@ class BuildWeightsFileTest(unittest.TestCase):
     def test_all_zero_coefficients_raises(self):
         with self.assertRaises(ValueError):
             build_weights_file([0.0, -1.0, 0.0, 0.0, 0.0], 0.1, {})
+
+
+class CalibrationTest(unittest.TestCase):
+    def test_calibrated_file_keeps_default_weights(self):
+        data = build_calibrated_weights_file(1.35, 0.17, {"variant": "calibrated"})
+        self.assertEqual(data["weights"], WEIGHTS)
+        self.assertEqual(data["scale"], 1.35)
+        self.assertEqual(data["intercept"], 0.17)
+        self.assertEqual(data["trained"]["variant"], "calibrated")
+
+    def test_single_feature_fit_recovers_scale(self):
+        # 진짜 모델: logit(p) = 2.0*x + 0.1 → scale ≈ 2.0을 복원해야 한다.
+        rng = random.Random(5)
+        features, labels = [], []
+        for _ in range(4000):
+            x = rng.uniform(-1, 1)
+            p = sigmoid(2.0 * x + 0.1)
+            features.append([x])
+            labels.append(1 if rng.random() < p else 0)
+        (scale,), intercept = train_logistic(
+            features, labels, epochs=4000, l2=0.0, non_negative=True
+        )
+        self.assertAlmostEqual(scale, 2.0, delta=0.3)
+        self.assertAlmostEqual(intercept, 0.1, delta=0.15)
+
+    def test_predict_calibrated_uses_default_ensemble(self):
+        samples = replay_season(make_synthetic_season(), min_games=15)
+        sample = samples[0]
+        x = default_ensemble_logit(sample)
+        self.assertAlmostEqual(
+            predict_calibrated(sample, 1.0, 0.0), sigmoid(x), places=9
+        )
 
 
 if __name__ == "__main__":
